@@ -1,0 +1,17 @@
+bin/
+dist/
+*.log
+.env
+.env.*
+deployments/.env
+
+# Local credentials and certificates
+.local/
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+
+# OS
+.DS_Store

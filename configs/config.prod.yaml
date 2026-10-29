@@ -1,0 +1,20 @@
+# Production environment overrides (ARK_ENV_MODE=prod).
+# All secrets via environment variables; the DB/Redis hosts live in the
+# deployment environment.
+oauth2:
+  cookie:
+    # Production is served over HTTPS. Apple form_post callbacks require
+    # Secure cookies, which enables SameSite=None in CookieManager.
+    secure: true
+
+db:
+  dsn: ""   # ARK_DB_DSN -> user:pass@tcp(<prod-mysql>:3306)/ark-kvm?charset=utf8mb4&parseTime=True&loc=UTC
+
+redis:
+  db: 10
+
+release:
+  download-cdn: "https://app.arkkvm.com/dl-img/arkkvm/"
+
+log:
+  level: info

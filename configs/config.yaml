@@ -1,0 +1,106 @@
+# Base configuration — environment profiles (config.testing.yaml /
+# config.prod.yaml / config.cn.yaml) merge on top; secrets arrive via
+# environment variables only.
+server:
+  port: 6612
+
+# Local ip2region v3 databases. Empty paths disable location for that family.
+# These proxy settings apply only to GET /ip; trust only actual ingress peers.
+ip:
+  v4-db-path: ""        # ARK_IP_V4_DB_PATH
+  v6-db-path: ""        # ARK_IP_V6_DB_PATH
+  trusted-proxies: []    # ARK_IP_TRUSTED_PROXIES, comma-separated IPs/CIDRs
+
+db:
+  driver: mysql   # mysql | postgres
+  dsn: ""         # ARK_DB_DSN, e.g. user:pass@tcp(mysql:3306)/ark-kvm?charset=utf8mb4&parseTime=True&loc=UTC
+
+redis:
+  addr: "redis:6379"
+  password: ""    # ARK_REDIS_PASSWORD
+  db: 11
+
+oauth2:
+  google:
+    client-id: ""            # OAUTH_GOOGLE_CLIENT_ID
+    client-secret: ""        # OAUTH_GOOGLE_CLIENT_SECRET
+    redirect-uri: "{baseUrl}/oauth2/code/google"
+    scope: "openid email profile"
+    auth-uri: "https://accounts.google.com/o/oauth2/v2/auth"
+    token-uri: "https://oauth2.googleapis.com/token"
+    jwks-uri: "https://www.googleapis.com/oauth2/v3/certs"
+    verify-id-token: true
+  # New providers: registered only when BOTH id and secret are set
+  # (a half-configured provider would register a login that always fails).
+  # Endpoints below default automatically; only secrets need env wiring.
+  microsoft:                 # OAUTH_MICROSOFT_CLIENT_ID / OAUTH_MICROSOFT_CLIENT_SECRET
+    client-id: ""
+    client-secret: ""
+    redirect-uri: "{baseUrl}/oauth2/code/microsoft"
+    tenant: "common"         # iss is prefix/suffix-checked (home-tenant varies)
+  github:                    # OAUTH_GITHUB_CLIENT_ID / OAUTH_GITHUB_CLIENT_SECRET
+    client-id: ""
+    client-secret: ""
+    redirect-uri: "{baseUrl}/oauth2/code/github"
+  wechat:                    # OAUTH_WECHAT_APP_ID / OAUTH_WECHAT_APP_SECRET (needs open-platform qualification, D2)
+    app-id: ""
+    app-secret: ""
+    redirect-uri: "{baseUrl}/oauth2/code/wechat"   # domain must match the registered 授权回调域
+  # Sign in with Apple: all four values required (the client_secret is a
+  # JWT signed with the p8 team key, so id/team/key/key-material must all
+  # be present). Callback is response_mode=form_post (Apple POSTs to us).
+  apple:                     # OAUTH_APPLE_CLIENT_ID (Services ID) / OAUTH_APPLE_TEAM_ID / OAUTH_APPLE_KEY_ID / OAUTH_APPLE_PRIVATE_KEY (p8)
+    client-id: ""
+    team-id: ""
+    key-id: ""
+    private-key: ""          # p8 PEM raw, \n-escaped, or a file path
+    redirect-uri: "{baseUrl}/oauth2/code/apple"
+  # Phase-C gate: stop the legacy clientId/oidcGoogle
+  # params on google PAIRING redirects for devices with cloud_version >= this
+  # threshold. Empty = never stop (current behavior). Arm it only after the
+  # de-providerized firmware version is final and OTA telemetry confirms.
+  pairing:
+    stop-legacy-params-version: ""   # OAUTH_PAIRING_STOP_LEGACY_PARAMS_VERSION, e.g. "0.4.26091001"
+  cookie:
+    signing-key: ""   # COOKIE_SIGNING_KEY
+    max-age: 86400
+    secure: false
+  trust-proxy-headers: true
+  quick-login-require-secret: true   # /oidc/quick must present the device secretToken
+
+webrtc:
+  cloudflare:
+    turn-key-id: ""      # TURN_KEY_ID
+    turn-api-token: ""   # TURN_API_TOKEN
+  ice-servers:
+    - "stun:stun.cloudflare.com:3478"
+    - "stun:stun.l.google.com:19302"
+    - "stun:stun1.l.google.com:5349"
+
+release:
+  download-cdn: "https://app.arkkvm.com/dl-img/arkkvm/"   # RELEASE_DOWNLOAD_CDN
+
+sign:
+  keystore:
+    path: "/data/keystore/server.p12"   # KEYSTORE_PATH
+    password: ""                        # KEYSTORE_PASSWORD
+
+auth:
+  jwt-secret-key: ""   # ARK_JWT_SECRET — must equal the legacy sa-token jwt-secret-key (device firmware validates the token shape)
+
+security:
+  expose-sensitive-fields: false   # strips oidcToken/secretToken from API responses
+
+cors:
+  allow-origins:
+    - "*"
+
+log:
+  level: info   # ARK_LOG_LEVEL
+
+ws:
+  heartbeat-interval: 60s
+  read-deadline: 180s
+  write-timeout: 30s
+  send-buffer-size: 256
+  max-message-size: 524288   # 512KB, aligned with the legacy firmware

@@ -1,0 +1,47 @@
+# Testing-environment compose. Port 6614 lets the service run in parallel
+# with another instance on 6612; adjust as needed. Secrets come from the
+# .env file or the shell — never commit them.
+services:
+  arkkvm-cloud-testing:
+    container_name: arkkvm-cloud-testing
+    build:
+      context: ../
+      dockerfile: deployments/Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+    ports:
+      - "6614:6612"
+    volumes:
+      - /data:/data   # keystore: /data/keystore/server.p12
+    environment:
+      ARK_ENV_MODE: testing
+      ARK_DB_DRIVER: mysql
+      ARK_DB_DSN: ${ARK_DB_DSN}
+      ARK_REDIS_ADDR: redis:6379
+      ARK_REDIS_PASSWORD: ${ARK_REDIS_PASSWORD}
+      ARK_REDIS_DB: "11"
+      OAUTH_GOOGLE_CLIENT_ID: ${OAUTH_GOOGLE_CLIENT_ID}
+      OAUTH_GOOGLE_CLIENT_SECRET: ${OAUTH_GOOGLE_CLIENT_SECRET}
+      # Multi-provider OAuth — unset vars mean "not configured",
+      # the provider is simply not registered.
+      OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
+      OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
+      OAUTH_GITHUB_CLIENT_ID: ${OAUTH_GITHUB_CLIENT_ID:-}
+      OAUTH_GITHUB_CLIENT_SECRET: ${OAUTH_GITHUB_CLIENT_SECRET:-}
+      OAUTH_WECHAT_APP_ID: ${OAUTH_WECHAT_APP_ID:-}
+      OAUTH_WECHAT_APP_SECRET: ${OAUTH_WECHAT_APP_SECRET:-}
+      OAUTH_APPLE_CLIENT_ID: ${OAUTH_APPLE_CLIENT_ID:-}
+      OAUTH_APPLE_TEAM_ID: ${OAUTH_APPLE_TEAM_ID:-}
+      OAUTH_APPLE_KEY_ID: ${OAUTH_APPLE_KEY_ID:-}
+      OAUTH_APPLE_PRIVATE_KEY: ${OAUTH_APPLE_PRIVATE_KEY:-}
+      COOKIE_SIGNING_KEY: ${COOKIE_SIGNING_KEY}
+      TURN_KEY_ID: ${TURN_KEY_ID}
+      TURN_API_TOKEN: ${TURN_API_TOKEN}
+      KEYSTORE_PASSWORD: ${KEYSTORE_PASSWORD}
+    restart: always
+    networks:
+      - docker-net
+
+networks:
+  docker-net:
+    external: true

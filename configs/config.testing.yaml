@@ -1,0 +1,19 @@
+# Testing environment overrides (ARK_ENV_MODE=testing).
+oauth2:
+  cookie:
+    # Apple uses a cross-site form_post callback. HTTPS deployments need
+    # Secure cookies so CookieManager selects SameSite=None.
+    secure: true
+
+db:
+  dsn: ""   # ARK_DB_DSN -> user:pass@tcp(mysql:3306)/ark-kvm-test?charset=utf8mb4&parseTime=True&loc=UTC
+
+redis:
+  addr: "redis:6379"
+  db: 11
+
+release:
+  download-cdn: ""   # testing CDN base URL (RELEASE_DOWNLOAD_CDN)
+
+log:
+  level: debug
