@@ -8,8 +8,8 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
 )
 
 // fakeUserStore / fakeIdentityStore implement the service-layer store

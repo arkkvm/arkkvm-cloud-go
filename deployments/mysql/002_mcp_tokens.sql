@@ -1,5 +1,5 @@
--- 002_mcp_tokens.sql — first-class credentials for the arkkvm_mcp host tool.
--- Replaces the web-session-token capture: the MCP tool now
+-- 002_mcp_tokens.sql — first-class credentials for the arkkvm_mcp host tool
+-- (doc 16 §2). Replaces the web-session-token capture: the MCP tool now
 -- exchanges a one-time grant code (Redis ARK:AUTH:MCPCODE, minted by the
 -- OAuth callback when the authorize flow carries client=mcp) for a dedicated
 -- long-lived token, so MCP and browser sessions stop evicting each other

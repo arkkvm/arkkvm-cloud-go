@@ -7,7 +7,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/service"
 	"github.com/gin-gonic/gin"
 )
 

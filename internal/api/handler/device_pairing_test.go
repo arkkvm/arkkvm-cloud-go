@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,9 +19,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/service"
 )
 
 type pairingHarness struct {
@@ -47,7 +49,7 @@ func newPairingHarness(t *testing.T) *pairingHarness {
 	tokens := auth.NewTokenService(rdb, "test-secret")
 	handler := NewDeviceHandler(service.NewDeviceService(repository.NewDeviceRepo(db), nil), tokens)
 	r := gin.New()
-	r.POST("/devices/:id/bind", auth.RequireAuth(tokens), handler.Bind)
+	r.POST("/devices/:id/bind", auth.RequireAuth(tokens, []string{"https://app.example.com/ad-login"}), handler.Bind)
 	r.POST("/devices/token", handler.ExchangeToken)
 	t.Cleanup(func() {
 		if err := mock.ExpectationsWereMet(); err != nil {
@@ -62,7 +64,9 @@ func (h *pairingHarness) request(t *testing.T, path, credential, body string) *h
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if credential != "" {
-		req.Header.Set("Authorization", "Bearer "+credential)
+		req.AddCookie(&http.Cookie{Name: auth.BrowserSessionCookieName, Value: credential})
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set(auth.CSRFHeader, h.tokens.BrowserCSRFToken(credential))
 	}
 	w := httptest.NewRecorder()
 	h.router.ServeHTTP(w, req)
@@ -93,15 +97,19 @@ func TestPairingSwitchAccountBeforeDeviceRegistration(t *testing.T) {
 		}
 	}
 	var first string
+	requestID := protectedRequest(t, h, "dev-1")
 	var final *auth.DevicePairing
 	for _, uid := range []int64{41, 42} {
+		if uid == 42 {
+			requestID = protectedRequest(t, h, "dev-1")
+		}
 		login, err := h.tokens.Login(ctx, uid, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Confirmation is allowed only a read, never INSERT/UPDATE.
 		h.mock.ExpectQuery("SELECT .*device").WithArgs("dev-1", 1).WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "secret_token"}))
-		w := h.request(t, "/devices/dev-1/bind", login, `{"userId":99}`)
+		w := h.request(t, "/devices/dev-1/bind", login, `{"userId":99,"requestId":"`+requestID+`","confirm":true}`)
 		body := pairingJSON(t, w)
 		if body["success"] != true {
 			t.Fatalf("confirmation failed: %s", w.Body.String())
@@ -139,7 +147,7 @@ func TestPairingSwitchAccountBeforeDeviceRegistration(t *testing.T) {
 		h.mock.ExpectQuery("SELECT .*FOR UPDATE").WithArgs("dev-1", 1).
 			WillReturnRows(sqlmock.NewRows([]string{"id", "user_id", "secret_token"}).AddRow("dev-1", 42, final.SecretToken))
 		h.mock.ExpectCommit()
-		w := h.request(t, "/devices/token", "", `{"tempToken":"`+final.TempToken+`"}`)
+		w := h.request(t, "/devices/token", "", `{"tempToken":"`+final.TempToken+`","requestId":"`+requestID+`","codeVerifier":"`+testBindingVerifier+`"}`)
 		body := pairingJSON(t, w)
 		if w.Code != 200 || body["secretToken"] != final.SecretToken || body["userId"] != float64(42) || len(body) != 2 {
 			t.Fatalf("device exchange contract changed: %s", w.Body.String())
@@ -155,7 +163,7 @@ func TestPairingConfirmationGuards(t *testing.T) {
 		success              bool
 	}{
 		{"new_device", "session", "dev-1", 0, false, true},
-		{"same_owner", "session", "dev-1", 42, false, true},
+		{"same_owner", "session", "dev-1", 42, false, false},
 		{"other_owner", "session", "dev-1", 99, false, false},
 		{"database_error", "session", "dev-1", 0, true, false},
 		{"missing_login", "", "dev-1", 0, false, false},
@@ -192,7 +200,8 @@ func TestPairingConfirmationGuards(t *testing.T) {
 					WillReturnRows(sqlmock.NewRows([]string{"provider", "email", "display_name"}).
 						AddRow("apple", "owner@example.com", "Owner Name"))
 			}
-			w := h.request(t, "/devices/"+tc.id+"/bind", credential, "")
+			requestID := protectedRequest(t, h, tc.id)
+			w := h.request(t, "/devices/"+tc.id+"/bind", credential, `{"requestId":"`+requestID+`","confirm":true}`)
 			body := pairingJSON(t, w)
 			if body["success"] != tc.success {
 				t.Fatalf("unexpected response: %d %s", w.Code, w.Body.String())
@@ -225,10 +234,23 @@ func TestPairingConflictDoesNotDependOnOwnerProfileLookup(t *testing.T) {
 	h.mock.ExpectQuery("SELECT .*device").WithArgs("dev-1", 1).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "user_id"}).AddRow("dev-1", 99))
 	h.mock.ExpectQuery("SELECT .*user_identities").WithArgs(int64(99)).WillReturnError(errors.New("profile unavailable"))
-	w := h.request(t, "/devices/dev-1/bind", login, "")
+	requestID := protectedRequest(t, h, "dev-1")
+	w := h.request(t, "/devices/dev-1/bind", login, `{"requestId":"`+requestID+`","confirm":true}`)
 	body := pairingJSON(t, w)
 	data := body["data"].(map[string]any)
 	if body["success"] != false || data["reason"] != "DEVICE_ALREADY_BOUND" || data["boundAccount"] != nil {
 		t.Fatalf("ownership guard changed: %s", w.Body.String())
 	}
+}
+
+var testBindingVerifier = base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+
+func protectedRequest(t *testing.T, h *pairingHarness, id string) string {
+	t.Helper()
+	digest := sha256.Sum256([]byte(testBindingVerifier))
+	p, err := h.tokens.CreateBindingRequest(context.Background(), id, "http://192.168.77.39/ad-login", base64.RawURLEncoding.EncodeToString(digest[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p.RequestID
 }

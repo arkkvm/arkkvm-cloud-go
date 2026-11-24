@@ -15,6 +15,48 @@ func loadEnv(t *testing.T) {
 	t.Setenv("ARK_JWT_SECRET", "jwt-secret")
 }
 
+func TestOAuthCookieSecureDefault(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ARK_ENV_MODE", "local")
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "config.yaml"), "server:\n  port: 6612\n")
+	cfg, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OAuth2.Cookie.Secure {
+		t.Fatal("omitted OAuth cookie secure setting must default to true")
+	}
+}
+
+func TestShippedOAuthCookiesSecure(t *testing.T) {
+	loadEnv(t)
+	for _, env := range []string{"local", "testing", "cn", "prod"} {
+		t.Run(env, func(t *testing.T) {
+			t.Setenv("ARK_ENV_MODE", env)
+			cfg, err := Load("../../configs")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.OAuth2.Cookie.Secure {
+				t.Fatal("shipped OAuth cookies must use Secure")
+			}
+		})
+	}
+}
+
+func TestObsoleteSignalingConfigurationIsIgnored(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ARK_ENV_MODE", "local")
+	t.Setenv("ARK_WS_ALLOW_LEGACY_QUERY_TOKEN", "true")
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "config.yaml"), "server:\n  port: 6612\nws:\n  allow-legacy-query-token: true\n")
+	if _, err := Load(dir); err != nil {
+		t.Fatal(err)
+	}
+	// There is no legacy credential field or authentication branch to reenable.
+}
+
 func writeFile(t *testing.T, path, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -73,4 +115,26 @@ func TestRepoCNOverlayWithdrawsGoogle(t *testing.T) {
 		}
 	}
 	t.Fatalf("configs/config.cn.yaml must list google in oauth2.disabled-providers, got %v", cfg.OAuth2.DisabledProviders)
+}
+
+func TestOAuthReturnURLsEnvironmentOverride(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ARK_ENV_MODE", "local")
+	t.Setenv("OAUTH_ALLOWED_RETURN_URLS", "http://localhost/ad-login,https://selfhost.example/ad-login")
+	cfg, err := Load("../../configs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.OAuth2.AllowedReturnURLs) != 2 {
+		t.Fatalf("unexpected callback registrations: %v", cfg.OAuth2.AllowedReturnURLs)
+	}
+}
+
+func TestOAuthReturnURLsRejectInvalidConfiguration(t *testing.T) {
+	loadEnv(t)
+	t.Setenv("ARK_ENV_MODE", "local")
+	t.Setenv("OAUTH_ALLOWED_RETURN_URLS", "https://app.example/ad-login?redirect=attacker")
+	if _, err := Load("../../configs"); err == nil {
+		t.Fatal("invalid callback configuration accepted")
+	}
 }

@@ -31,38 +31,82 @@ func abort401(c *gin.Context) {
 	})
 }
 
-// RequireAuth validates the bearer token and stores the user id in the
-// context. Unauthenticated requests abort with 401 in the BaseResult shape
-// (mirroring the legacy NotLoginException handler).
-func RequireAuth(tokens *TokenService) gin.HandlerFunc {
+const sessionTokenKey = "auth.sessionToken"
+
+// SessionToken returns the credential actually validated by RequireAuth.
+func SessionToken(c *gin.Context) string {
+	value, _ := c.Get(sessionTokenKey)
+	token, _ := value.(string)
+	return token
+}
+
+func setSession(c *gin.Context, userID int64, token string) {
+	c.Set(userIDKey, userID)
+	c.Set(sessionTokenKey, token)
+}
+
+func requireBrowserSession(c *gin.Context, tokens *TokenService, origins []string) {
+	token, present, err := BrowserSessionCookie(c.Request)
+	if err != nil || !present {
+		abort401(c)
+		return
+	}
+	unsafe := c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead
+	unsafe = unsafe || c.Request.URL.Path == "/logout"
+	if !IsAllowedBrowserRequest(c.Request, origins, unsafe) {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+	userID, _, err := tokens.Resolve(c.Request.Context(), token)
+	if err != nil {
+		abort401(c)
+		return
+	}
+	if unsafe && !tokens.ValidBrowserCSRF(c.Request, token) {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+	c.Header(CSRFHeader, tokens.BrowserCSRFToken(token))
+	c.Header("Cache-Control", "no-store")
+	setSession(c, userID, token)
+	c.Next()
+}
+
+// Browser sessions are Cookie-only; explicit credentials cannot bypass Origin/CSRF.
+func RequireAuth(tokens *TokenService, allowed ...[]string) gin.HandlerFunc {
+	var origins []string
+	if len(allowed) > 0 {
+		origins = allowed[0]
+	}
 	return func(c *gin.Context) {
-		token := BearerToken(c.GetHeader("Authorization"))
-		userID, _, err := tokens.Resolve(c.Request.Context(), token)
-		if err != nil {
+		if len(c.Request.Header.Values("Authorization")) != 0 {
 			abort401(c)
 			return
 		}
-		c.Set(userIDKey, userID)
-		c.Next()
+		requireBrowserSession(c, tokens, origins)
 	}
 }
 
-// RequireAuthOrMcp guards the routes the MCP credential may use: session resolution runs first with unchanged semantics for browser
-// clients; only its failure falls back to the dedicated MCP token. Any other
-// route keeps plain RequireAuth, so the MCP power surface stays a fixed
-// allowlist.
-func RequireAuthOrMcp(tokens *TokenService, mcp *McpTokenService) gin.HandlerFunc {
+// Cookie authentication never falls back to MCP. Only explicit Bearer may
+// resolve the dedicated MCP credential on the existing fixed allowlist.
+func RequireAuthOrMcp(tokens *TokenService, mcp *McpTokenService, allowed ...[]string) gin.HandlerFunc {
+	var origins []string
+	if len(allowed) > 0 {
+		origins = allowed[0]
+	}
 	return func(c *gin.Context) {
-		token := BearerToken(c.GetHeader("Authorization"))
-		userID, _, err := tokens.Resolve(c.Request.Context(), token)
-		if err == nil {
-			c.Set(userIDKey, userID)
-			c.Next()
+		if len(c.Request.Header.Values("Authorization")) == 0 {
+			requireBrowserSession(c, tokens, origins)
 			return
 		}
+		if len(c.Request.Header.Values("Authorization")) != 1 {
+			abort401(c)
+			return
+		}
+		token := BearerToken(c.GetHeader("Authorization"))
 		if mcp != nil {
-			if mcpID, merr := mcp.Resolve(c.Request.Context(), token); merr == nil {
-				c.Set(userIDKey, mcpID)
+			if id, err := mcp.Resolve(c.Request.Context(), token); err == nil {
+				c.Set(userIDKey, id)
 				c.Next()
 				return
 			}
@@ -71,7 +115,7 @@ func RequireAuthOrMcp(tokens *TokenService, mcp *McpTokenService) gin.HandlerFun
 	}
 }
 
-// RequireMcp authenticates the dedicated MCP credential ONLY:
+// RequireMcp authenticates the dedicated MCP credential ONLY (doc 16 §3.4):
 // used by POST /mcp/revoke. Sessions are deliberately rejected — a web
 // session must never implicitly revoke MCP credentials.
 func RequireMcp(mcp *McpTokenService) gin.HandlerFunc {

@@ -8,7 +8,7 @@ import "time"
 // AUTO_INCREMENT while bytes columns are NOT NULL without defaults. Insert
 // path was broken in the legacy Java deployment too (0 rows despite usage;
 // MyBatis-Plus generated snake_case columns that don't exist). Column tags
-// here match reality; the id problem is flagged in — the table
+// here match reality; the id problem is flagged in doc 10 §8.1 — the table
 // needs a one-line ALTER (AUTO_INCREMENT) or a rebuild in the PG migration.
 type TurnActivity struct {
 	ID            int64     `gorm:"column:id;primaryKey"`

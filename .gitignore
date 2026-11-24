@@ -1,17 +1,37 @@
 bin/
-dist/
 *.log
 .env
-.env.*
 deployments/.env
+.zcode/
 
-# Local credentials and certificates
+# macOS
+.DS_Store
+
+/.codegraph
+# Local development credentials and certificates
+.env.local
 .local/
+
+# Local documentation and agent handoff notes (not part of code submissions)
+/docs/
+/AGENTS.md
+
+# Environment files and private credentials
+.env.*
 *.pem
 *.key
 *.p8
 *.p12
 *.pfx
 
-# OS
-.DS_Store
+# Local development helpers
+/scripts/dev-local.sh
+/scripts/dev-local-tunnel.sh
+
+# Private production deployment templates
+/deploy/prod/
+
+# Build and deployment archives
+/dist/
+*.zip
+*.tar.gz

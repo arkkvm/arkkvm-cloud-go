@@ -8,8 +8,8 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
 )
 
 // userStore / identityStore abstract the repositories so the upsert policy
@@ -36,14 +36,14 @@ func NewUserService(users *repository.UserRepo, identities *repository.IdentityR
 	return &UserService{users: users, identities: identities}
 }
 
-// UpsertByIdentity resolves a login identity to a user id (,
+// UpsertByIdentity resolves a login identity to a user id (doc 14 §2.2,
 // D1 conservative: NO email-based linking — providers only ever match on
 // (provider, provider_user_id) or create a fresh user; different providers
 // are always distinct accounts):
-// 1. identity hit -> refresh non-empty identity and user profile fields;
-// google additionally syncs oidc_token for the legacy offer frame;
-// 2. no hit -> create the user + identity (google fills the legacy
-// columns; others write email for display only; wechat has none).
+//  1. identity hit  -> refresh non-empty identity and user profile fields;
+//     google additionally syncs oidc_token for the legacy offer frame;
+//  2. no hit        -> create the user + identity (google fills the legacy
+//     columns; others write email for display only; wechat has none).
 //
 // Google identity hits are guaranteed for pre-existing users by the
 // user_identities backfill (deployments/mysql/001_user_identities.sql).

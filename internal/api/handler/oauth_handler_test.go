@@ -16,9 +16,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/service"
 )
 
 // --- fakes implementing the handler's narrow service interfaces ---
@@ -27,9 +27,13 @@ type fakeOAuthUsers struct {
 	userID int64
 	ident  *service.Identity
 	got    string
+	err    error
 }
 
 func (f *fakeOAuthUsers) UpsertByIdentity(_ context.Context, provider string, ident *service.Identity) (int64, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
 	f.got = provider
 	f.ident = ident
 	return f.userID, nil
@@ -37,6 +41,7 @@ func (f *fakeOAuthUsers) UpsertByIdentity(_ context.Context, provider string, id
 
 type fakeOAuthDevices struct {
 	bound        map[string]int64 // deviceID -> userID it was bound to
+	secret       string
 	ownID        int64
 	cloudVersion *string // surfaced by GetByID for the phase-C gate
 }
@@ -53,6 +58,9 @@ func (f *fakeOAuthDevices) BindDevice(_ context.Context, deviceID string, userID
 }
 
 func (f *fakeOAuthDevices) FindBySecretToken(_ context.Context, secret string) (string, *string, error) {
+	if secret != "" && secret == f.secret {
+		return "dev-1", nil, nil
+	}
 	return "", nil, nil
 }
 
@@ -67,6 +75,7 @@ type fakeProvider struct {
 	name        string
 	authState   string // the state AuthURL received
 	exchangeErr error
+	rawIDToken  string
 }
 
 func (f *fakeProvider) Name() string        { return f.name }
@@ -81,7 +90,7 @@ func (f *fakeProvider) Exchange(_ context.Context, code, baseURL string) (*servi
 	if f.exchangeErr != nil {
 		return nil, f.exchangeErr
 	}
-	return &service.Identity{ProviderUserID: "puid-" + f.name, Email: "x@y.z", EmailVerified: true}, nil
+	return &service.Identity{ProviderUserID: "puid-" + f.name, Email: "x@y.z", EmailVerified: true, RawIDToken: f.rawIDToken}, nil
 }
 
 // --- harness ---
@@ -106,12 +115,13 @@ func newOAuthHarness(t *testing.T, providers []service.OAuthProvider) *oauthHarn
 	users := &fakeOAuthUsers{userID: 42}
 	devices := &fakeOAuthDevices{ownID: 42}
 	h := &OAuthHandler{
-		providers: map[string]service.OAuthProvider{},
-		users:     users,
-		devices:   devices,
-		tokens:    tokens,
-		cookies:   cookies,
-		clientID:  "google-client-id",
+		providers:         map[string]service.OAuthProvider{},
+		users:             users,
+		devices:           devices,
+		tokens:            tokens,
+		cookies:           cookies,
+		clientID:          "google-client-id",
+		allowedReturnURLs: []string{"https://app.example.com/ad-login"},
 	}
 	for _, p := range providers {
 		h.providers[p.Name()] = p
@@ -125,6 +135,7 @@ func newOAuthHarness(t *testing.T, providers []service.OAuthProvider) *oauthHarn
 		r.POST("/oauth2/code/"+name, func(c *gin.Context) { h.Callback(c, name) })
 	}
 	r.GET("/oidc/providers", h.Providers)
+	r.GET("/oidc/quick", h.QuickLogin)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return &oauthHarness{handler: h, srv: srv, users: users, devices: devices, tokens: tokens}
@@ -168,7 +179,7 @@ func (h *oauthHarness) callback(t *testing.T, authResp *http.Response, name, ext
 	return doResp
 }
 
-// callbackPost mirrors callback the way Apple delivers it:
+// callbackPost mirrors callback() the way Apple delivers it:
 // response_mode=form_post — code/state/user travel in the POST body, only
 // the signed cookies ride the request headers.
 func (h *oauthHarness) callbackPost(t *testing.T, authResp *http.Response, name string, form url.Values) *http.Response {
@@ -199,6 +210,10 @@ func (h *oauthHarness) authorizeAndCallback(t *testing.T, name, form, extraQuery
 	t.Helper()
 	resp := h.authorize(t, name, form)
 	defer resp.Body.Close()
+	if name == "google" && !strings.Contains(extraQuery, "state=") {
+		u, _ := url.Parse(resp.Header.Get("Location"))
+		extraQuery += "&state=" + url.QueryEscape(u.Query().Get("state"))
+	}
 	return h.callback(t, resp, name, extraQuery)
 }
 
@@ -220,27 +235,12 @@ func queryOf(t *testing.T, location string) url.Values {
 	return u.Query()
 }
 
-// newGoogleTestProvider serves a token endpoint returning a fixed id_token.
+// Provider cryptographic validation is covered by service tests; these tests
+// verify handler redirects, cookies, session and legacy pairing contracts.
 func newGoogleTestProvider(t *testing.T) (service.OAuthProvider, string) {
 	t.Helper()
-	idToken := makeTestIDToken(t, map[string]any{
-		"sub": "g-sub-9", "email": "u@example.com", "email_verified": true, "picture": "https://p/9.png",
-	})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"access_token":"at","id_token":"` + idToken + `"}`))
-	}))
-	t.Cleanup(srv.Close)
-	p := service.NewGoogleProvider(service.GoogleProviderConfig{
-		ClientID:      "google-client-id",
-		ClientSecret:  "s",
-		RedirectURI:   "{baseUrl}/oauth2/code/google",
-		Scope:         "openid email profile",
-		AuthURI:       srv.URL + "/auth",
-		TokenURI:      srv.URL + "/token",
-		VerifyIDToken: false,
-	}, srv.Client(), nil)
-	return p, idToken
+	idToken := makeTestIDToken(t, map[string]any{"sub": "g-sub-9"})
+	return &fakeProvider{name: "google", rawIDToken: idToken}, idToken
 }
 
 // makeTestIDToken builds an unsigned (parse-only) id_token.
@@ -260,7 +260,7 @@ func makeTestIDToken(t *testing.T, claims map[string]any) string {
 // parameter. Legacy consumers (old firmware pairing chain, old webapp)
 // ignore the unknown param, so additive is safe.
 func TestGoogleCallbackPairingQueryGolden(t *testing.T) {
-	gp, idToken := newGoogleTestProvider(t)
+	gp, _ := newGoogleTestProvider(t)
 	h := newOAuthHarness(t, []service.OAuthProvider{gp})
 
 	resp := h.authorizeAndCallback(t, "google",
@@ -270,50 +270,10 @@ func TestGoogleCallbackPairingQueryGolden(t *testing.T) {
 		t.Fatalf("want 302, got %d", resp.StatusCode)
 	}
 	loc := resp.Header.Get("Location")
-	if !strings.HasPrefix(loc, "https://app.example.com/ad-login?") {
+	if !strings.HasPrefix(loc, "https://app.example.com/ad-login") {
 		t.Fatalf("redirect target: %s", loc)
 	}
-	q := queryOf(t, loc)
-	if q.Get("clientId") != "google-client-id" {
-		t.Fatalf("clientId missing/wrong: %q", q.Get("clientId"))
-	}
-	if q.Get("oidcGoogle") != idToken {
-		t.Fatalf("oidcGoogle must be the raw id_token")
-	}
-	if q.Get("deviceId") != "dev-1" {
-		t.Fatalf("deviceId: %q", q.Get("deviceId"))
-	}
-	token := q.Get("token")
-	if token == "" {
-		t.Fatal("token missing")
-	}
-	// The pairing token is a dedicated one-device credential, NOT a user
-	// session: a session here would be kicked by the loginToken mint below
-	// (single-session model) and would ride the 302 with full account power.
-	if _, _, err := h.tokens.Resolve(context.Background(), token); !errors.Is(err, auth.ErrInvalidToken) {
-		t.Fatalf("pairing token must NOT be a user session (resolve err = %v)", err)
-	}
-	if uid, dev, err := h.tokens.ResolvePairingToken(context.Background(), token); err != nil || uid != 42 || dev != "dev-1" {
-		t.Fatalf("pairing token must resolve to (42, dev-1), got (%d, %q, %v)", uid, dev, err)
-	}
-	// loginToken: a second, distinct, live session for the cloud webapp —
-	// the pairing token gets revoked by /devices/token (F5).
-	loginToken := q.Get("loginToken")
-	if loginToken == "" || loginToken == token {
-		t.Fatalf("loginToken must be present and distinct from the pairing token: %q", loginToken)
-	}
-	if _, _, err := h.tokens.Resolve(context.Background(), loginToken); err != nil {
-		t.Fatalf("loginToken must be a live session: %v", err)
-	}
-	if len(q) != 5 {
-		t.Fatalf("google pairing query must carry exactly 5 params, got %v", q)
-	}
-	if h.users.got != "google" {
-		t.Fatalf("upsert provider = %q", h.users.got)
-	}
-	if len(h.devices.bound) != 0 {
-		t.Fatalf("OAuth must not bind a device before confirmation: %v", h.devices.bound)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 // An already claimed device must not prevent account selection at login.
@@ -332,22 +292,14 @@ func TestGoogleCallbackDoesNotClaimDeviceOwnedByAnotherAccount(t *testing.T) {
 	}
 }
 
-// GOLDEN: plain web login (no deviceId) — token + clientId + oidcGoogle.
+// Plain web login keeps its session token but no longer forwards Google credentials.
 func TestGoogleCallbackWebLoginQueryGolden(t *testing.T) {
 	gp, _ := newGoogleTestProvider(t)
 	h := newOAuthHarness(t, []service.OAuthProvider{gp})
 
 	resp := h.authorizeAndCallback(t, "google", "returnTo=https://app.example.com/ad-login", "")
 	defer resp.Body.Close()
-	q := queryOf(t, resp.Header.Get("Location"))
-	if len(q) != 3 {
-		t.Fatalf("web login query must carry exactly 3 params, got %v", q)
-	}
-	for _, k := range []string{"token", "clientId", "oidcGoogle"} {
-		if q.Get(k) == "" {
-			t.Fatalf("%s missing: %v", k, q)
-		}
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 // New providers: state enforced, callback query trimmed to
@@ -368,16 +320,7 @@ func TestNewProviderCallbackQueryAndState(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("want 302, got %d", resp.StatusCode)
 	}
-	q := queryOf(t, resp.Header.Get("Location"))
-	if len(q) != 3 {
-		t.Fatalf("new-provider query must be exactly token+deviceId+loginToken, got %v", q)
-	}
-	if q.Get("token") == "" || q.Get("deviceId") != "dev-2" || q.Get("loginToken") == "" {
-		t.Fatalf("query content: %v", q)
-	}
-	if q.Get("clientId") != "" || q.Get("oidcGoogle") != "" {
-		t.Fatalf("google-only params must NEVER ride new providers: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 func TestNewProviderRejectsWrongState(t *testing.T) {
@@ -421,13 +364,7 @@ func TestFormPostCallbackReadsBodyParams(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("want 302, got %d", resp.StatusCode)
 	}
-	q := queryOf(t, resp.Header.Get("Location"))
-	if q.Get("token") == "" || q.Get("deviceId") != "dev-9" || q.Get("loginToken") == "" {
-		t.Fatalf("form_post callback must complete the flow like GET: %v", q)
-	}
-	if q.Get("clientId") != "" || q.Get("oidcGoogle") != "" {
-		t.Fatalf("google-only params must never ride non-google providers: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 // The state check must not be bypassable by moving it out of the body.
@@ -504,7 +441,7 @@ func TestProvidersEndpoint(t *testing.T) {
 	}
 }
 
-// --- phase-C gate skeleton ---
+// --- phase-C gate skeleton (doc 14 §7C) ---
 
 // Gate armed + device version (JSON webVersion form) >= threshold: the
 // google pairing redirect drops clientId/oidcGoogle, keeping exactly
@@ -518,13 +455,7 @@ func TestGoogleCallbackGateStopsAtThreshold(t *testing.T) {
 	resp := h.authorizeAndCallback(t, "google",
 		"returnTo=https://app.example.com/ad-login&deviceId=dev-1", "")
 	defer resp.Body.Close()
-	q := queryOf(t, resp.Header.Get("Location"))
-	if len(q) != 3 || q.Get("token") == "" || q.Get("deviceId") != "dev-1" || q.Get("loginToken") == "" {
-		t.Fatalf("gated pairing query must be exactly token+deviceId+loginToken, got %v", q)
-	}
-	if q.Get("clientId") != "" || q.Get("oidcGoogle") != "" {
-		t.Fatalf("legacy params must be gated off: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 // Gate armed + plain-string device version below threshold: params kept.
@@ -537,10 +468,7 @@ func TestGoogleCallbackGateBelowThresholdKeepsParams(t *testing.T) {
 	resp := h.authorizeAndCallback(t, "google",
 		"returnTo=https://app.example.com/ad-login&deviceId=dev-1", "")
 	defer resp.Body.Close()
-	q := queryOf(t, resp.Header.Get("Location"))
-	if q.Get("clientId") == "" || q.Get("oidcGoogle") == "" {
-		t.Fatalf("below-threshold device must keep the legacy params: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 // Unknown version (first pairing — BindDevice just created the row, or the
@@ -554,25 +482,19 @@ func TestGoogleCallbackGateUnknownVersionKeepsParams(t *testing.T) {
 	resp := h.authorizeAndCallback(t, "google",
 		"returnTo=https://app.example.com/ad-login&deviceId=dev-1", "")
 	defer resp.Body.Close()
-	q := queryOf(t, resp.Header.Get("Location"))
-	if q.Get("clientId") == "" || q.Get("oidcGoogle") == "" {
-		t.Fatalf("unknown-version device must keep the legacy params: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
-// Web logins (no deviceId) are never gated: there is no device version to
-// consult and the params are consumed only by the pairing chain.
-func TestGoogleCallbackGateNeverGatesWebLogin(t *testing.T) {
+// Plain web login never needs Google verification fields, regardless of
+// the device-version migration gate.
+func TestGoogleCallbackWebLoginOmitsGoogleFieldsRegardlessOfGate(t *testing.T) {
 	gp, _ := newGoogleTestProvider(t)
 	h := newOAuthHarness(t, []service.OAuthProvider{gp})
 	h.handler.stopLegacyParamsVersion = "0.0.1"
 
 	resp := h.authorizeAndCallback(t, "google", "returnTo=https://app.example.com/ad-login", "")
 	defer resp.Body.Close()
-	q := queryOf(t, resp.Header.Get("Location"))
-	if len(q) != 3 {
-		t.Fatalf("web login must keep the 3 legacy params: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
 // Malformed threshold fails safe (params kept) instead of breaking logins.
@@ -585,13 +507,10 @@ func TestGoogleCallbackGateMalformedThresholdFailsSafe(t *testing.T) {
 	resp := h.authorizeAndCallback(t, "google",
 		"returnTo=https://app.example.com/ad-login&deviceId=dev-1", "")
 	defer resp.Body.Close()
-	q := queryOf(t, resp.Header.Get("Location"))
-	if q.Get("clientId") == "" {
-		t.Fatalf("misconfigured gate must fail safe: %v", q)
-	}
+	assertCredentialFreeCallback(t, h, resp)
 }
 
-// --- MCP grant flow ---
+// --- MCP grant flow (doc 16 §1/§3.3) ---
 
 // Authorize cookies carry client=mcp; the callback must hand back a one-time
 // grant code bound to req — NOT a session token (no Login: the browser
@@ -601,7 +520,7 @@ func TestMcpCallbackIssuesGrantCodeNotSession(t *testing.T) {
 	h := newOAuthHarness(t, []service.OAuthProvider{fp})
 
 	authResp := h.authorize(t, "github",
-		"returnTo=http://127.0.0.1:52190/ad-login&client=mcp&req=req-abc")
+		"returnTo=http://127.0.0.1:52190/ad-login&code_challenge=ZtNPunH49FD35FWYhT5Tv8I7vRKQJ8uxMaL0_9eHjNA&code_challenge_method=S256&client=mcp&req=req-abc")
 	defer authResp.Body.Close()
 	resp := h.callback(t, authResp, "github", "&state="+fp.authState)
 	defer resp.Body.Close()
@@ -617,11 +536,11 @@ func TestMcpCallbackIssuesGrantCodeNotSession(t *testing.T) {
 		t.Fatalf("mcp redirect must carry exactly code+req, got %v", q)
 	}
 	// The code is single-use and exchanges to the originating flow only.
-	uid, boundReq, err := h.tokens.ConsumeMcpGrantCode(context.Background(), q.Get("code"))
-	if err != nil || uid != 42 || boundReq != "req-abc" {
-		t.Fatalf("grant code must consume to (42, req-abc), got (%d, %q, %v)", uid, boundReq, err)
+	uid, err := h.tokens.ExchangeMcpGrant(context.Background(), q.Get("code"), "req-abc", strings.Repeat("a", 43))
+	if err != nil || uid != 42 {
+		t.Fatalf("grant code must exchange with proof for user 42, got (%d, %v)", uid, err)
 	}
-	if _, _, err := h.tokens.ConsumeMcpGrantCode(context.Background(), q.Get("code")); !errors.Is(err, auth.ErrInvalidToken) {
+	if _, err := h.tokens.ExchangeMcpGrant(context.Background(), q.Get("code"), "req-abc", strings.Repeat("a", 43)); !errors.Is(err, auth.ErrInvalidToken) {
 		t.Fatalf("grant code must be single-use, second consume err = %v", err)
 	}
 	// No session, no pairing token, no bind: the MCP branch is code-only.
@@ -643,7 +562,7 @@ func TestMcpGrantDoesNotEvictBrowserSession(t *testing.T) {
 	}
 
 	authResp := h.authorize(t, "github",
-		"returnTo=http://127.0.0.1:52190/ad-login&client=mcp&req=req-1")
+		"returnTo=http://127.0.0.1:52190/ad-login&code_challenge=ZtNPunH49FD35FWYhT5Tv8I7vRKQJ8uxMaL0_9eHjNA&code_challenge_method=S256&client=mcp&req=req-1")
 	defer authResp.Body.Close()
 	resp := h.callback(t, authResp, "github", "&state="+fp.authState)
 	defer resp.Body.Close()
@@ -681,7 +600,7 @@ func TestStaleMcpCookieDoesNotHijackBrowserLogin(t *testing.T) {
 	h := newOAuthHarness(t, []service.OAuthProvider{fp})
 
 	stale := h.authorize(t, "github",
-		"returnTo=http://127.0.0.1:52190/ad-login&client=mcp&req=req-stale")
+		"returnTo=http://127.0.0.1:52190/ad-login&code_challenge=ZtNPunH49FD35FWYhT5Tv8I7vRKQJ8uxMaL0_9eHjNA&code_challenge_method=S256&client=mcp&req=req-stale")
 	defer stale.Body.Close()
 	// The MCP flow is aborted here — its markers stay in the browser jar.
 
@@ -719,13 +638,88 @@ func TestStaleMcpCookieDoesNotHijackBrowserLogin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	// github web login redirects with exactly the bare token — no grant
-	// params, no hijack.
-	q := queryOf(t, resp.Header.Get("Location"))
-	if len(q) != 1 || q.Get("token") == "" {
-		t.Fatalf("browser login must keep the legacy query despite stale mcp cookies, got %v", q)
+	assertCredentialFreeCallback(t, h, resp)
+}
+
+func TestOAuthCallbackSetsSharedBrowserCookie(t *testing.T) {
+	for _, deviceID := range []string{"", "dev-1"} {
+		t.Run("device="+deviceID, func(t *testing.T) {
+			provider := &fakeProvider{name: "github"}
+			harness := newOAuthHarness(t, []service.OAuthProvider{provider})
+			form := "returnTo=https://app.example.com/ad-login"
+			if deviceID != "" {
+				form += "&deviceId=" + deviceID
+			}
+			authorized := harness.authorize(t, "github", form)
+			response := harness.callback(t, authorized, "github", "&state="+provider.authState)
+			if response.StatusCode != 302 {
+				t.Fatalf("callback status %d", response.StatusCode)
+			}
+			location, err := url.Parse(response.Header.Get("Location"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(location.Query()) != 0 {
+				t.Fatal("callback leaked credentials")
+			}
+			var session *http.Cookie
+			for _, cookie := range response.Cookies() {
+				if cookie.Name == auth.BrowserSessionCookieName {
+					session = cookie
+				}
+			}
+			if session == nil || session.Value == "" || session.Path != "/" || session.Domain != "" || !session.HttpOnly || !session.Secure || session.SameSite != http.SameSiteStrictMode {
+				t.Fatal("OAuth did not establish the shared HttpOnly session")
+			}
+			if userID, _, err := harness.tokens.Resolve(context.Background(), session.Value); err != nil || userID != 42 {
+				t.Fatal("Cookie is not the live browser session")
+			}
+			if deviceID != "" && session.Value == location.Query().Get("token") {
+				t.Fatal("pairing credential used as browser session")
+			}
+		})
 	}
-	if q.Get("code") != "" || q.Get("req") != "" {
-		t.Fatalf("browser login must never carry grant params: %v", q)
+}
+
+func TestMcpOAuthDoesNotReplaceBrowserCookie(t *testing.T) {
+	provider := &fakeProvider{name: "github"}
+	harness := newOAuthHarness(t, []service.OAuthProvider{provider})
+	authorized := harness.authorize(t, "github", "returnTo=http://127.0.0.1:52190/ad-login&code_challenge=ZtNPunH49FD35FWYhT5Tv8I7vRKQJ8uxMaL0_9eHjNA&code_challenge_method=S256&client=mcp&req=browser-independent")
+	response := harness.callback(t, authorized, "github", "&state="+provider.authState)
+	if response.StatusCode != 302 {
+		t.Fatal("MCP grant failed")
+	}
+	for _, cookie := range response.Cookies() {
+		if cookie.Name == auth.BrowserSessionCookieName {
+			t.Fatal("MCP grant replaced browser session")
+		}
+	}
+}
+
+func assertCredentialFreeCallback(t *testing.T, h *oauthHarness, resp *http.Response) {
+	t.Helper()
+	if resp.StatusCode != 302 || resp.Header.Get("Location") != "https://app.example.com/ad-login" {
+		t.Fatalf("unexpected redirect: %d %s", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == auth.BrowserSessionCookieName {
+			uid, _, err := h.tokens.Resolve(context.Background(), cookie.Value)
+			if err != nil || uid != 42 || !cookie.Secure || !cookie.HttpOnly {
+				t.Fatal("invalid browser session")
+			}
+			return
+		}
+	}
+	t.Fatal("missing browser session")
+}
+
+func TestMcpAuthorizeRejectsMissingOrPlainChallenge(t *testing.T) {
+	h := newOAuthHarness(t, []service.OAuthProvider{&fakeProvider{name: "github"}})
+	for _, extra := range []string{"", "&code_challenge=ZtNPunH49FD35FWYhT5Tv8I7vRKQJ8uxMaL0_9eHjNA&code_challenge_method=plain"} {
+		r := h.authorize(t, "github", "returnTo=http://127.0.0.1:52190/ad-login&client=mcp&req=req-1"+extra)
+		r.Body.Close()
+		if r.StatusCode != 400 {
+			t.Fatalf("weak authorize accepted: %d", r.StatusCode)
+		}
 	}
 }

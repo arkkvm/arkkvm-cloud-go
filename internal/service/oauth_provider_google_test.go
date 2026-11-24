@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -24,19 +26,14 @@ func goldGoogleCfg() GoogleProviderConfig {
 	}
 }
 
-// GOLDEN: the Google authorize URL must stay byte-identical (prompt=consent,
-// no state — legacy webapps and the pairing chain depend on it).
-func TestGoogleAuthURLGolden(t *testing.T) {
+func TestGoogleAuthURLStateAndNonce(t *testing.T) {
 	p := NewGoogleProvider(goldGoogleCfg(), nil, nil)
-	got := p.AuthURL("https://app.example.com", "ignored-state")
-	want := "https://accounts.test/auth?client_id=g-client-id&prompt=consent&" +
-		"redirect_uri=https%3A%2F%2Fapp.example.com%2Foauth2%2Fcode%2Fgoogle&" +
-		"response_type=code&scope=openid+email+profile"
-	if got != want {
-		t.Fatalf("authorize URL drifted:\n got %s\nwant %s", got, want)
+	u, _ := url.Parse(p.AuthURL("https://app.example.com", "browser-state"))
+	if !p.RequiresState() || u.Query().Get("state") != "browser-state" || u.Query().Get("nonce") != GoogleNonce("browser-state") {
+		t.Fatal("Google must bind authorization to state and nonce")
 	}
-	if p.RequiresState() {
-		t.Fatal("google must not require state (legacy wire)")
+	if u.Query().Get("prompt") != "consent" || u.Query().Get("client_id") != "g-client-id" {
+		t.Fatal("legacy authorization parameters changed")
 	}
 }
 
@@ -55,7 +52,11 @@ func unsignedIDToken(t *testing.T, claims map[string]any) string {
 func TestGoogleExchangeFormGolden(t *testing.T) {
 	var gotForm url.Values
 	var gotCT, gotAccept string
-	idToken := unsignedIDToken(t, map[string]any{
+	signer := newTestRSAKey(t)
+	jwks := signer.jwksServer(t)
+	defer jwks.Close()
+	idToken := signer.sign(t, map[string]any{
+		"iss": "https://accounts.google.com", "aud": "g-client-id", "exp": time.Now().Add(time.Hour).Unix(), "nonce": GoogleNonce("state"),
 		"sub": "sub-1", "email": "u@example.com", "email_verified": true, "picture": "https://p/x.png", "name": "Google User",
 	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -70,9 +71,10 @@ func TestGoogleExchangeFormGolden(t *testing.T) {
 
 	cfg := goldGoogleCfg()
 	cfg.TokenURI = srv.URL
+	cfg.JWKSURI = jwks.URL
 	p := NewGoogleProvider(cfg, srv.Client(), nil)
 
-	ident, err := p.Exchange(context.Background(), "the-code", "https://app.example.com")
+	ident, err := p.Exchange(WithGoogleState(context.Background(), "state"), "the-code", "https://app.example.com")
 	if err != nil {
 		t.Fatalf("exchange: %v", err)
 	}
@@ -105,26 +107,93 @@ func TestGoogleExchangeFormGolden(t *testing.T) {
 	}
 }
 
-// GOLDEN: with verification enabled, a JWKS failure degrades to parse-only
-// instead of failing login (deployed semantics — do not "fix").
-func TestGoogleVerificationDegradesWhenJWKSUnreachable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestGoogleVerificationFailsClosed(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		cfg := goldGoogleCfg()
+		cfg.VerifyIDToken = enabled
+		cfg.JWKSURI = "http://127.0.0.1:0/certs"
+		p := NewGoogleProvider(cfg, nil, nil)
+		if claims, err := p.parseIDToken(unsignedIDToken(t, map[string]any{"sub": "s"})); err == nil || claims != nil {
+			t.Fatal("signature verification failure must not return claims, even with legacy verification switch disabled")
+		}
+	}
+}
+
+// Reproduce the reported C4 input through the complete exchange path rather
+// than only calling the parser: a successful token response, invalid ID token,
+// and an unavailable verification key must never produce an identity.
+func TestGoogleExchangeRejectsReportedC4Scenario(t *testing.T) {
+	jwks := httptest.NewServer(http.NotFoundHandler())
+	defer jwks.Close()
+	idToken := unsignedIDToken(t, map[string]any{"sub": "c4-test", "exp": int64(1)})
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id_token":"` + unsignedIDToken(t, map[string]any{"sub": "s"}) + `"}`))
+		_ = json.NewEncoder(w).Encode(map[string]string{"id_token": idToken})
+	}))
+	defer tokenEndpoint.Close()
+	for _, enabled := range []bool{true, false} {
+		cfg := goldGoogleCfg()
+		cfg.TokenURI, cfg.JWKSURI, cfg.VerifyIDToken = tokenEndpoint.URL, jwks.URL, enabled
+		p := NewGoogleProvider(cfg, nil, nil)
+		ident, err := p.Exchange(WithGoogleState(context.Background(), "test-state"), "test-code", "https://app.example.com")
+		if err == nil || ident != nil {
+			t.Fatalf("verify=%v: reported C4 input returned an identity", enabled)
+		}
+		if googleFailureReason(err) != "jwks_http_failure" {
+			t.Fatalf("verify=%v: expected rejection at JWKS verification, got %v", enabled, err)
+		}
+	}
+}
+
+func TestGoogleClaimsValidation(t *testing.T) {
+	signer := newTestRSAKey(t)
+	jwks := signer.jwksServer(t)
+	defer jwks.Close()
+	cfg := goldGoogleCfg()
+	cfg.JWKSURI = jwks.URL
+	p := NewGoogleProvider(cfg, nil, nil)
+	for _, tc := range []struct {
+		name  string
+		field string
+		value any
+		valid bool
+	}{
+		{"valid", "iss", "https://accounts.google.com", true},
+		{"legacy issuer", "iss", "accounts.google.com", true},
+		{"wrong issuer", "iss", "https://attacker.example", false},
+		{"missing issuer", "iss", "", false},
+		{"wrong audience", "aud", "another-client", false},
+		{"missing audience", "aud", nil, false},
+		{"multiple audiences without azp", "aud", []string{"g-client-id", "other"}, false},
+		{"wrong azp", "azp", "other", false},
+		{"expired", "exp", int64(1), false},
+		{"missing expiry", "exp", int64(0), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := map[string]any{"sub": "s", "iss": "https://accounts.google.com", "aud": "g-client-id", "exp": time.Now().Add(time.Hour).Unix()}
+			claims[tc.field] = tc.value
+			_, err := p.parseIDToken(signer.sign(t, claims))
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v, error=%v", tc.valid, err)
+			}
+		})
+	}
+	// A valid signature cannot compensate for a mismatched transaction nonce.
+	token := signer.sign(t, map[string]any{"sub": "s", "iss": "https://accounts.google.com", "aud": "g-client-id", "exp": time.Now().Add(time.Hour).Unix(), "nonce": GoogleNonce("original")})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"id_token": token})
 	}))
 	defer srv.Close()
-	cfg := goldGoogleCfg()
-	cfg.TokenURI = srv.URL
-	cfg.VerifyIDToken = true
-	cfg.JWKSURI = "http://127.0.0.1:0/certs" // unreachable
-	p := NewGoogleProvider(cfg, srv.Client(), nil)
-
-	ident, err := p.Exchange(context.Background(), "c", "https://app.example.com")
-	if err != nil {
-		t.Fatalf("exchange must degrade, not fail: %v", err)
-	}
-	if ident.ProviderUserID != "s" {
-		t.Fatalf("degraded parse must still yield claims, got %+v", ident)
+	p.cfg.TokenURI = srv.URL
+	for _, state := range []string{"", "other", "original"} {
+		ident, err := p.Exchange(WithGoogleState(context.Background(), state), "code", "https://app.example.com")
+		if state == "original" {
+			if err != nil || ident == nil {
+				t.Fatal(err)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), "nonce") {
+			t.Fatal("nonce mismatch accepted")
+		}
 	}
 }
 
@@ -145,5 +214,14 @@ func TestGoogleHTTPClientDefaults(t *testing.T) {
 	p := NewGoogleProvider(goldGoogleCfg(), nil, nil)
 	if p.client == nil || p.client.Timeout != 10*time.Second {
 		t.Fatal("default client must be 10s-timeout http.Client")
+	}
+}
+
+func TestGoogleFailureReasonNeverEchoesUnknownErrors(t *testing.T) {
+	if got := googleFailureReason(errors.New("authorization-code=private-code token=private-token")); got != "failed" {
+		t.Fatalf("unexpected diagnostic category: %s", got)
+	}
+	if got := googleFailureReason(context.DeadlineExceeded); got != "timeout" {
+		t.Fatal(got)
 	}
 }

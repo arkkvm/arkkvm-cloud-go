@@ -5,14 +5,17 @@
 package main
 
 import (
+	"arkkvm.com/arkkvm-cloud/internal/analytics"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
+	stdlog "log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,13 +27,14 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/api"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/api/handler"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/config"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/ws"
+	"arkkvm.com/arkkvm-cloud/internal/api"
+	"arkkvm.com/arkkvm-cloud/internal/api/handler"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/config"
+	"arkkvm.com/arkkvm-cloud/internal/pkg"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/ws"
 )
 
 var version = "dev" // set via -ldflags "-X main.version=..."
@@ -50,6 +54,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	trustedProxies, err := pkg.NewTrustedProxies(cfg.IP.TrustedProxies)
+	if err != nil {
+		slog.Error("invalid trusted proxy configuration", "error", err)
+		os.Exit(1)
+	}
 	level := parseLevel(cfg.Log.Level)
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})).
 		With("app", "arkkvm-cloud", "version", version)
@@ -75,8 +84,8 @@ func main() {
 	deviceRepo := repository.NewDeviceRepo(db)
 	releaseRepo := repository.NewReleaseRepo(db)
 	turnRepo := repository.NewTurnActivityRepo(db)
-	// Dedicated arkkvm_mcp credential: long-lived, DB-backed,
-	// revocable — never a Login session (single-session coexistence).
+	// Dedicated arkkvm_mcp credential (doc 16): long-lived, DB-backed,
+	// revocable — never a Login() session (single-session coexistence).
 	mcpTokenRepo := repository.NewMcpTokenRepo(db)
 	mcpTokens := auth.NewMcpTokenService(mcpTokenRepo)
 
@@ -88,7 +97,7 @@ func main() {
 
 	users := service.NewUserService(userRepo, identityRepo)
 
-	// OAuth registry: google is served with its legacy wire
+	// OAuth registry (doc 14 §4): google is served with its legacy wire
 	// behavior unless the deployment withdraws it; the new providers register
 	// only when fully configured (empty
 	// client-id/app-id OR secret -> no routes — a half-configured provider
@@ -175,6 +184,8 @@ func main() {
 		_ = deviceRepo.UpdateLastSeen(deviceID)
 	})
 	devices := service.NewDeviceService(deviceRepo, hub)
+	tokens.OnRevoked = func(token string) { hub.RevokeCredential(token, false) }
+	mcpTokens.OnRevoked = func(token string) { hub.RevokeCredential(token, true) }
 
 	// WebSocket endpoints.
 	wsOpts := ws.Options{
@@ -186,7 +197,8 @@ func main() {
 	}
 	lifetime, shutdown := context.WithCancel(context.Background())
 	deviceWS := &ws.DeviceEndpoint{
-		Hub: hub, RealDevice: devices, Options: wsOpts, Log: log, Lifetime: lifetime,
+		TrustedProxies: trustedProxies,
+		Hub:            hub, RealDevice: devices, Options: wsOpts, Log: log, Lifetime: lifetime,
 	}
 	iceCredIssuer := func() []ws.ICEServerCred {
 		ice, err := turnSvc.CachedCredentials(lifetime)
@@ -196,7 +208,8 @@ func main() {
 		return []ws.ICEServerCred{{URLs: ice.URLs, Username: ice.Username, Credential: ice.Credential}}
 	}
 	clientWS := &ws.ClientEndpoint{
-		Hub: hub, Tokens: tokens, McpTokens: mcpTokens, Devices: devices, Users: users,
+		AllowedReturnURLs: cfg.OAuth2.AllowedReturnURLs,
+		Hub:               hub, Tokens: tokens, McpTokens: mcpTokens, Devices: devices, Users: users,
 		ICEServers: cfg.WebRTC.ICEServers, ICECredIssuer: iceCredIssuer,
 		Options: wsOpts, Log: log, Lifetime: lifetime,
 	}
@@ -209,23 +222,34 @@ func main() {
 	if geoErr != nil {
 		log.Warn("IP location database unavailable; affected lookups return no location", "error", geoErr)
 	}
+	// Explicit source prevents test data entering production totals. Disabled by default.
+	if source := os.Getenv("ARK_ANALYTICS_SOURCE"); source == "testing" || source == "cn" || source == "overseas" {
+		collector := analytics.New(db, geoIP, source, log)
+		deviceWS.OnConnected = func(id, ip string, ctx context.Context) { collector.Track("device", id, ip, ctx) }
+		clientWS.OnConnected = func(id int64, r *http.Request, ctx context.Context) {
+			collector.Track("user", strconv.FormatInt(id, 10), trustedProxies.ClientIP(r).String(), ctx)
+		}
+		go collector.Run(lifetime)
+	}
 	ipHandler, err := handler.NewIPHandler(geoIP, cfg.IP.TrustedProxies)
 	if err != nil {
 		log.Error("invalid IP proxy configuration", "error", err)
 		os.Exit(1)
 	}
 	router := api.NewRouter(api.Deps{
-		IP:        ipHandler,
-		Tokens:    tokens,
-		Mcp:       handler.NewMcpHandler(tokens, mcpTokens),
-		McpTokens: mcpTokens,
-		Users:     handler.NewUserHandler(users, tokens),
-		Devices:   handler.NewDeviceHandler(devices, tokens),
+		BrowserOrigins: cfg.OAuth2.AllowedReturnURLs,
+		IP:             ipHandler,
+		Tokens:         tokens,
+		Mcp:            handler.NewMcpHandler(tokens, mcpTokens),
+		McpTokens:      mcpTokens,
+		Users:          handler.NewUserHandler(users, tokens),
+		Devices:        handler.NewDeviceHandler(devices, tokens, trustedProxies),
 		OAuth: handler.NewOAuthHandler(oauthProviders, users, devices, tokens, cookies,
 			cfg.OAuth2.TrustProxyHeaders, cfg.OAuth2.QuickLoginRequireSecret,
-			cfg.OAuth2.Google.ClientID, cfg.OAuth2.Pairing.StopLegacyParamsVersion),
+			cfg.OAuth2.Google.ClientID, cfg.OAuth2.Pairing.StopLegacyParamsVersion,
+			cfg.OAuth2.AllowedReturnURLs, trustedProxies),
 		Release: handler.NewReleaseHandler(releases),
-		Webrtc:  handler.NewWebrtcHandler(hub, devices, turnSvc, turnRepo),
+		Webrtc:  handler.NewWebrtcHandler(turnSvc, turnRepo),
 		ReadyCheck: func() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
@@ -301,7 +325,13 @@ func withoutDisabledProviders(providers []service.OAuthProvider, disabled []stri
 
 func openDB(cfg *config.Config) (*gorm.DB, error) {
 	gormCfg := &gorm.Config{
-		Logger:         gormlogger.Default.LogMode(gormlogger.Warn),
+		Logger: gormlogger.New(stdlog.New(os.Stderr, "", stdlog.LstdFlags), gormlogger.Config{
+			SlowThreshold:             200 * time.Millisecond,
+			LogLevel:                  gormlogger.Warn,
+			IgnoreRecordNotFoundError: true,
+			ParameterizedQueries:      true,
+			Colorful:                  false,
+		}),
 		TranslateError: true, // surfaces duplicate-key as gorm.ErrDuplicatedKey (identity upsert race)
 	}
 	switch cfg.DB.Driver {

@@ -4,7 +4,7 @@ import "time"
 
 // Device maps to table "device".
 // BatchNo exists in the live schema (written by admin-api, not mapped by the
-// legacy Java DO): it must be preserved and never cleared on updates.
+// legacy Java DO): it must be preserved and never cleared on updates (doc 10 §4.1).
 // No created_at/updated_at columns exist — see the User model note.
 type Device struct {
 	ID           string     `gorm:"column:id;primaryKey"` // device-supplied primary key, varchar(32)

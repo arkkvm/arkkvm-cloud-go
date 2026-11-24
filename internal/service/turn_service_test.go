@@ -14,12 +14,12 @@ func TestGenerateCredentialsStaticFallback(t *testing.T) {
 	// No Cloudflare key and no self-hosted TURN: the static STUN list is
 	// returned as-is, no credentials attached — the console gates its
 	// WebSocket on this endpoint, so the STUN-only posture must answer.
-	svc := NewTurnService(TurnConfig{StaticStun: []string{"stun:stun.example.com:3478"}})
+	svc := NewTurnService(TurnConfig{StaticStun: []string{"stun:stun.arkkvm.cn:3478"}})
 	ice, err := svc.GenerateCredentials(context.Background())
 	if err != nil {
 		t.Fatalf("static fallback returned error: %v", err)
 	}
-	if len(ice.URLs) != 1 || ice.URLs[0] != "stun:stun.example.com:3478" {
+	if len(ice.URLs) != 1 || ice.URLs[0] != "stun:stun.arkkvm.cn:3478" {
 		t.Fatalf("unexpected static urls: %v", ice.URLs)
 	}
 	if ice.Username != "" || ice.Credential != "" {
@@ -44,9 +44,9 @@ func TestGenerateCredentialsSelfHosted(t *testing.T) {
 	// the Cloudflare stun+turn shape).
 	const secret = "shared-secret-for-tests"
 	svc := NewTurnService(TurnConfig{
-		StaticStun:         []string{"stun:stun.example.com:3478"},
+		StaticStun:         []string{"stun:stun.arkkvm.cn:3478"},
 		SelfHostedSecret:   secret,
-		SelfHostedTurnURLs: []string{"turn:stun.example.com:3478?transport=udp", "turn:stun.example.com:3478?transport=tcp"},
+		SelfHostedTurnURLs: []string{"turn:stun.arkkvm.cn:3478?transport=udp", "turn:stun.arkkvm.cn:3478?transport=tcp"},
 	})
 	before := time.Now().Unix()
 	ice, err := svc.GenerateCredentials(context.Background())
@@ -56,9 +56,9 @@ func TestGenerateCredentialsSelfHosted(t *testing.T) {
 	after := time.Now().Unix()
 
 	if len(ice.URLs) != 3 ||
-		ice.URLs[0] != "stun:stun.example.com:3478" ||
-		ice.URLs[1] != "turn:stun.example.com:3478?transport=udp" ||
-		ice.URLs[2] != "turn:stun.example.com:3478?transport=tcp" {
+		ice.URLs[0] != "stun:stun.arkkvm.cn:3478" ||
+		ice.URLs[1] != "turn:stun.arkkvm.cn:3478?transport=udp" ||
+		ice.URLs[2] != "turn:stun.arkkvm.cn:3478?transport=tcp" {
 		t.Fatalf("unexpected ice urls (stun must precede turn): %v", ice.URLs)
 	}
 	expiry, err := strconv.ParseInt(ice.Username, 10, 64)
@@ -82,7 +82,7 @@ func TestGenerateCredentialsCloudflareWinsOverSelfHosted(t *testing.T) {
 	svc := NewTurnService(TurnConfig{
 		CloudflareKeyID:    "key-id",
 		SelfHostedSecret:   "s",
-		SelfHostedTurnURLs: []string{"turn:stun.example.com:3478"},
+		SelfHostedTurnURLs: []string{"turn:stun.arkkvm.cn:3478"},
 	})
 	// No HTTP stub: the Cloudflare path is taken, and the request fails fast
 	// against the unreachable test endpoint — the error text identifies it.

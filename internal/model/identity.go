@@ -2,7 +2,7 @@ package model
 
 import "time"
 
-// UserIdentity maps to table "user_identities": one row per
+// UserIdentity maps to table "user_identities" (doc 14 §2.1): one row per
 // (provider, provider_user_id) login identity, linked to a user row.
 // provider_user_id semantics: google/microsoft = OIDC sub, github = numeric
 // REST id, wechat = unionid when present, else openid.

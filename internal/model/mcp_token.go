@@ -1,12 +1,17 @@
 package model
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
-// McpToken maps to table "mcp_tokens": the first-class credential
+var ErrMcpTokenNotFound = errors.New("MCP token not found")
+
+// McpToken maps to table "mcp_tokens" (doc 16 §2): the first-class credential
 // for the arkkvm_mcp host tool. Only the SHA-256 hex of the bearer token is
 // stored — the plaintext is returned exactly once by POST /mcp/token. Tokens
-// never expire on their own; revoked_at marks explicit revocation and
-// last_used_at is the staleness marker.
+// expire after seven idle days or thirty days from issuance. revoked_at
+// marks explicit revocation; last_used_at advances only after valid authentication.
 type McpToken struct {
 	ID         int64      `gorm:"column:id;primaryKey;autoIncrement"`
 	UserID     int64      `gorm:"column:user_id;index:idx_mcp_tokens_user"`

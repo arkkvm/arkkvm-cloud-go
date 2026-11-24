@@ -1,9 +1,9 @@
--- 001_user_identities.sql — multi-provider OAuth account model.
+-- 001_user_identities.sql — multi-provider OAuth account model (doc 14 §2.1).
 -- The legacy "user" table is untouched: Google logins keep double-writing
 -- google_id/oidc_token/picture there so /me googleId and the offer frame
 -- stay byte-compatible.
 --
--- Deployment order: run this file BEFORE deploying the new
+-- Deployment order (doc 14 §8): run this file BEFORE deploying the new
 -- image — the backfill below guarantees existing Google users hit the
 -- (provider, provider_user_id) lookup on their first post-deploy login.
 --

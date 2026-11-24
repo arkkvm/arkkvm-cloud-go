@@ -1,5 +1,5 @@
 # Multi-stage build: compile inside the container — the host needs no Go
-# toolchain.
+# toolchain (unlike the legacy flow that ran maven on the server).
 FROM golang:1.26-alpine AS build
 # Module proxy is overridable for region-constrained builders: pass
 # --build-arg GOPROXY=https://goproxy.cn,direct when building from CN.

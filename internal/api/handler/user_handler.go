@@ -1,16 +1,20 @@
 package handler
 
 import (
+	"encoding/base64"
 	"errors"
 	"net/http"
+	"net/netip"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/pkg"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/pkg"
+	"arkkvm.com/arkkvm-cloud/internal/service"
 )
 
 // UserHandler serves GET /me and GET /logout.
@@ -25,7 +29,7 @@ func NewUserHandler(users *service.UserService, tokens *auth.TokenService) *User
 
 // userView is the /me payload. Field names match the legacy UserDO
 // serialization; oidcToken is stripped unless expose-sensitive-fields is on
-// (, default stripped). identities is additive: the
+// (doc 06 §5, default stripped). identities is additive (doc 14 §4): the
 // login identities of the account, googleId and friends stay untouched.
 type userView struct {
 	ID       int64   `json:"id"`
@@ -62,6 +66,7 @@ func (h *UserHandler) Me(c *gin.Context) {
 		Email:    user.Email,
 		Picture:  user.Picture,
 	}
+
 	identities, err := h.users.ListIdentities(c.Request.Context(), user.ID)
 	if err != nil {
 		FailCode(c, http.StatusInternalServerError, "identity lookup failed")
@@ -94,6 +99,9 @@ func (h *UserHandler) Me(c *gin.Context) {
 	if exposeSensitive {
 		view.OIDCToken = user.OIDCToken
 	}
+	if token := auth.SessionToken(c); token != "" {
+		c.Header(auth.SessionReferenceHeader, auth.BrowserSessionReference(token))
+	}
 	OK(c, view)
 }
 
@@ -102,11 +110,12 @@ func hasProfileValue(value *string) bool {
 }
 
 func (h *UserHandler) Logout(c *gin.Context) {
-	token := auth.BearerToken(c.GetHeader("Authorization"))
+	token := auth.SessionToken(c)
 	if err := h.tokens.Logout(c.Request.Context(), token); err != nil {
 		FailCode(c, http.StatusInternalServerError, "logout failed")
 		return
 	}
+	auth.ClearBrowserSessionCookie(c.Writer)
 	OKEmpty(c)
 }
 
@@ -120,7 +129,7 @@ type deviceView struct {
 }
 
 // deviceDetailView is the DeviceDO-shaped response of GET /devices/{id} and
-// PUT /devices/{id}; secretToken is stripped by default.
+// PUT /devices/{id}; secretToken is stripped by default (doc 06 §5).
 type deviceDetailView struct {
 	ID           string        `json:"id"`
 	UserID       int64         `json:"userId"`
@@ -130,14 +139,19 @@ type deviceDetailView struct {
 	CloudVersion *string       `json:"cloudVersion"`
 }
 
-// DeviceHandler serves the /devices endpoints.
+// DeviceHandler serves the /devices endpoints (doc 02 §1.2).
 type DeviceHandler struct {
 	devices *service.DeviceService
 	tokens  *auth.TokenService
+	proxies *pkg.TrustedProxies
 }
 
-func NewDeviceHandler(devices *service.DeviceService, tokens *auth.TokenService) *DeviceHandler {
-	return &DeviceHandler{devices: devices, tokens: tokens}
+func NewDeviceHandler(devices *service.DeviceService, tokens *auth.TokenService, policies ...*pkg.TrustedProxies) *DeviceHandler {
+	h := &DeviceHandler{devices: devices, tokens: tokens}
+	if len(policies) == 1 {
+		h.proxies = policies[0]
+	}
+	return h
 }
 
 // Bind checks the selected account, then stages a pairing in Redis only.
@@ -145,6 +159,19 @@ func (h *DeviceHandler) Bind(c *gin.Context) {
 	deviceID := c.Param("id")
 	if len(deviceID) == 0 || len(deviceID) > 32 {
 		Fail(c, "invalid deviceId")
+		return
+	}
+	var req struct {
+		RequestID string `json:"requestId"`
+		Confirm   bool   `json:"confirm"`
+	}
+	if c.ShouldBindJSON(&req) != nil || !req.Confirm {
+		FailCode(c, http.StatusBadRequest, "firmware upgrade required")
+		return
+	}
+	pending, err := h.tokens.BindingRequest(c.Request.Context(), req.RequestID)
+	if err != nil || pending.DeviceID != deviceID {
+		FailCode(c, http.StatusBadRequest, "binding request expired")
 		return
 	}
 	userID := auth.UserID(c)
@@ -168,12 +195,19 @@ func (h *DeviceHandler) Bind(c *gin.Context) {
 		}
 		return
 	}
-	tempToken, err := h.tokens.IssueConfirmedPairingToken(c.Request.Context(), userID, deviceID, previousSecret)
+	// Binding an already provisioned device requires explicit unbinding first,
+	// including for the same owner. Never silently rotate its credential.
+	if previousSecret != nil {
+		FailCode(c, http.StatusConflict, "device must be unbound first")
+		return
+	}
+	pairing, err := h.tokens.ApproveBinding(c.Request.Context(), pending, userID)
 	if err != nil {
 		FailCode(c, http.StatusInternalServerError, "pairing token mint failed")
 		return
 	}
-	OK(c, gin.H{"deviceId": deviceID, "tempToken": tempToken})
+	c.Header("Cache-Control", "no-store")
+	OK(c, gin.H{"deviceId": deviceID, "requestId": pending.RequestID, "deviceReturnTo": pending.ReturnTo, "tempToken": pairing.TempToken})
 }
 
 func (h *DeviceHandler) List(c *gin.Context) {
@@ -260,21 +294,24 @@ func (h *DeviceHandler) CloudUnbind(c *gin.Context) {
 // ExchangeToken is POST /devices/token: confirmed tempToken -> permanent
 // secretToken. Successful validation commits the device binding atomically.
 // The response is a bare JSON object (no BaseResult envelope).
-// userId is additive (de-providerized firmware stores owner_user_id);
-// legacy firmware ignores the extra field.
+// userId is additive (de-providerized firmware stores owner_user_id, doc 05
+// §2.1); legacy firmware ignores the extra field.
 func (h *DeviceHandler) ExchangeToken(c *gin.Context) {
 	var req struct {
-		TempToken string `json:"tempToken" binding:"required"`
+		TempToken    string `json:"tempToken" binding:"required"`
+		RequestID    string `json:"requestId" binding:"required"`
+		CodeVerifier string `json:"codeVerifier" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		FailCode(c, http.StatusInternalServerError, "tempToken is required")
+		FailCode(c, http.StatusBadRequest, "binding proof is required")
 		return
 	}
-	secret, userID, err := h.devices.ExchangeDeviceToken(c.Request.Context(), h.tokens, req.TempToken)
+	secret, userID, err := h.devices.ExchangeDeviceToken(c.Request.Context(), h.tokens, req.TempToken, req.RequestID, req.CodeVerifier)
 	if err != nil {
-		FailCode(c, http.StatusInternalServerError, "invalid or expired confirmed pairing token")
+		FailCode(c, http.StatusUnauthorized, "invalid or expired confirmed pairing token")
 		return
 	}
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"secretToken": secret, "userId": userID})
 }
 
@@ -284,4 +321,73 @@ func jsonTimePtr(t *time.Time) *pkg.JsonTime {
 	}
 	jt := pkg.JsonTime(*t)
 	return &jt
+}
+
+// Only literal LAN addresses or mDNS names are eligible device callbacks.
+// No DNS resolution or server-side request is performed for this address.
+func validDeviceCallback(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path != "/ad-login" || u.RawPath != "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return false
+	}
+	host := u.Hostname()
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.IsPrivate() && ip.Zone() == ""
+	}
+	return regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.local$`).MatchString(host)
+}
+func (h *DeviceHandler) CreateBindingRequest(c *gin.Context) {
+	if !h.tokens.AllowBindingRequest(c.Request.Context(), pkg.RealIP(c.Request, h.proxies)) {
+		FailCode(c, 429, "too many binding requests")
+		return
+	}
+	var req struct {
+		DeviceID  string `json:"deviceId"`
+		ReturnTo  string `json:"deviceReturnTo"`
+		Challenge string `json:"challenge"`
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2048)
+	if c.ShouldBindJSON(&req) != nil || !regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`).MatchString(req.DeviceID) || !validDeviceCallback(req.ReturnTo) {
+		FailCode(c, 400, "invalid binding request")
+		return
+	}
+	b, err := base64.RawURLEncoding.DecodeString(req.Challenge)
+	if err != nil || len(b) != 32 || base64.RawURLEncoding.EncodeToString(b) != req.Challenge {
+		FailCode(c, 400, "invalid challenge")
+		return
+	}
+	p, err := h.tokens.CreateBindingRequest(c.Request.Context(), req.DeviceID, req.ReturnTo, req.Challenge)
+	if err != nil {
+		FailCode(c, 503, "binding request unavailable")
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	OK(c, gin.H{"requestId": p.RequestID, "expiresIn": 300})
+}
+func (h *DeviceHandler) BindingRequest(c *gin.Context) {
+	p, err := h.tokens.BindingRequest(c.Request.Context(), c.Param("requestId"))
+	if err != nil {
+		FailCode(c, 404, "binding request expired")
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	OK(c, gin.H{"requestId": p.RequestID, "deviceId": p.DeviceID, "deviceReturnTo": p.ReturnTo})
+}
+
+// BindingRequestStatus exposes only protocol readiness, never device details or proof.
+func (h *DeviceHandler) BindingRequestStatus(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	if !regexp.MustCompile(`^[a-f0-9]{64}$`).MatchString(c.Param("requestId")) {
+		FailCode(c, 400, "invalid binding request")
+		return
+	}
+	if !h.tokens.AllowBindingStatus(c.Request.Context(), pkg.RealIP(c.Request, h.proxies)) {
+		FailCode(c, 429, "too many binding status requests")
+		return
+	}
+	if _, err := h.tokens.BindingRequest(c.Request.Context(), c.Param("requestId")); err != nil {
+		FailCode(c, 404, "binding request expired")
+		return
+	}
+	OK(c, gin.H{"status": "ready"})
 }

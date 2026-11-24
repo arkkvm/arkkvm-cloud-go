@@ -1,4 +1,4 @@
-// Package service — OAuth provider abstraction.
+// Package service — OAuth provider abstraction (doc 14 §3).
 //
 // Every provider implements the authorization-code flow behind one interface:
 // build the consent URL, then swap the callback code for a normalized
@@ -27,8 +27,7 @@ type OAuthProvider interface {
 	Name() string
 
 	// AuthURL builds the consent-page redirect for the request's base URL.
-	// Providers that require CSRF state receive a non-empty state; Google
-	// ignores it (its legacy flow never carried state — wire locked).
+	// Providers that require CSRF state receive a non-empty state.
 	AuthURL(baseURL, state string) string
 
 	// Exchange swaps the authorization code for the provider identity
@@ -72,7 +71,7 @@ type jwsHeader struct {
 
 // verifyRS256Signature checks the RS256 signature of a JWS against the JWKS
 // at jwksURI. Shared by every OIDC provider; callers decide whether a
-// failure is fatal (Microsoft rejects, Google degrades — legacy semantics).
+// failure is fatal.
 func verifyRS256Signature(jwks *jwksCache, idToken, jwksURI string) error {
 	parts := splitJWS(idToken)
 	if len(parts) != 3 {

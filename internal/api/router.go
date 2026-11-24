@@ -1,26 +1,29 @@
 package api
 
 import (
+	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/api/handler"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/api/handler"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
 )
 
 // Deps bundles everything the router needs (wired in cmd/server/main.go).
 type Deps struct {
-	Tokens  *auth.TokenService
-	Mcp     *handler.McpHandler
-	Users   *handler.UserHandler
-	Devices *handler.DeviceHandler
-	OAuth   *handler.OAuthHandler
-	Release *handler.ReleaseHandler
-	Webrtc  *handler.WebrtcHandler
-	IP      *handler.IPHandler
+	BrowserOrigins []string
+	Tokens         *auth.TokenService
+	Mcp            *handler.McpHandler
+	Users          *handler.UserHandler
+	Devices        *handler.DeviceHandler
+	OAuth          *handler.OAuthHandler
+	Release        *handler.ReleaseHandler
+	Webrtc         *handler.WebrtcHandler
+	IP             *handler.IPHandler
 
-	// McpTokens authenticates the dedicated arkkvm_mcp credential.
+	// McpTokens authenticates the dedicated arkkvm_mcp credential (doc 16).
 	McpTokens *auth.McpTokenService
 
 	// ReadyCheck backs /readyz (MySQL + Redis connectivity).
@@ -31,18 +34,38 @@ type Deps struct {
 }
 
 // NewRouter assembles the route table with the legacy-accurate
-// public/protected split: everything except /oidc/**,
+// public/protected split (doc 02 §0.2): everything except /oidc/**,
 // /oauth2/**, /releases/**, /ip, /favicon.ico, the two device-self endpoints and
 // the WebSocket channels requires a bearer token.
 func NewRouter(d Deps) *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery(), auth.CORS([]string{"*"}))
+	legacyCORS := auth.CORS([]string{"*"})
+	r.Use(requestRecovery(slog.Default()), func(c *gin.Context) {
+		c.Writer.Header().Add("Vary", "Origin")
+		if auth.IsAllowedBrowserOrigin(c.GetHeader("Origin"), d.BrowserOrigins) {
+			c.Header("Access-Control-Allow-Origin", c.GetHeader("Origin"))
+			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-CSRF-Token")
+			c.Header("Access-Control-Expose-Headers", auth.CSRFHeader)
+			if c.Request.Method == http.MethodGet && c.Request.URL.Path == "/me" {
+				c.Header("Access-Control-Expose-Headers", auth.CSRFHeader+", "+auth.SessionReferenceHeader)
+			}
+			if c.Request.Method == http.MethodOptions {
+				c.AbortWithStatus(http.StatusNoContent)
+				return
+			}
+			c.Next()
+			return
+		}
+		legacyCORS(c)
+	})
 
 	r.GET("/healthz", func(c *gin.Context) { c.Status(http.StatusOK) })
 	r.GET("/readyz", func(c *gin.Context) {
 		if d.ReadyCheck != nil {
 			if err := d.ReadyCheck(); err != nil {
-				c.String(http.StatusServiceUnavailable, "not ready: %v", err)
+				c.String(http.StatusServiceUnavailable, "not ready")
 				return
 			}
 		}
@@ -61,8 +84,7 @@ func NewRouter(d Deps) *gin.Engine {
 		}
 		// One authorize/callback pair per configured provider; static routes
 		// (not :provider) so /oidc/providers coexists without a gin conflict.
-		// Google rides the same pair with legacy wire behavior (no state,
-		// google-only callback params) — the handler branches by provider.
+		// Google retains legacy pairing fields while enforcing state/nonce.
 		//
 		// GET is served alongside the legacy POST: Chromium refuses a
 		// cross-subdomain form POST under a form-action CSP even when the
@@ -81,35 +103,39 @@ func NewRouter(d Deps) *gin.Engine {
 		public.GET("/oidc/providers", d.OAuth.Providers)
 		public.GET("/oidc/quick", d.OAuth.QuickLogin)
 		public.GET("/releases", d.Release.Retrieve)
+		public.POST("/device-bindings", d.Devices.CreateBindingRequest)
+		public.GET("/device-bindings/:requestId/status", d.Devices.BindingRequestStatus)
 		public.POST("/devices/token", d.Devices.ExchangeToken)
 		public.DELETE("/devices/:id", d.Devices.Unbind) // device self-auth via secretToken
-		// MCP credential endpoints: the grant-code exchange is
+		// MCP credential endpoints (doc 16 §3.4): the grant-code exchange is
 		// public (the code itself is the secret); self-revoke requires the
 		// MCP credential and must reject sessions.
 		public.POST("/mcp/token", d.Mcp.ExchangeToken)
 	}
 
-	// MCP-authenticated REST: self-revoke only.
+	// MCP-authenticated REST (doc 16): self-revoke only.
 	mcpAuthed := r.Group("/", auth.RequireMcp(d.McpTokens))
 	{
 		mcpAuthed.POST("/mcp/revoke", d.Mcp.Revoke)
 	}
 
 	// Protected REST.
-	authed := r.Group("/", auth.RequireAuth(d.Tokens))
+	authed := r.Group("/", auth.RequireAuth(d.Tokens, d.BrowserOrigins))
 	{
 		authed.GET("/me", d.Users.Me)
 		authed.GET("/logout", d.Users.Logout)
-		// The three routes the MCP credential may use: session
-		// resolution first (unchanged for browsers), MCP token as fallback.
+		authed.POST("/logout", d.Users.Logout)
+		// The three routes the MCP credential may use (doc 16 §2):
+		// Cookie authentication for browsers, dedicated Bearer only for MCP.
 		// Everything below stays session-only, keeping the MCP power surface
 		// a fixed allowlist.
-		mcpReads := r.Group("/", auth.RequireAuthOrMcp(d.Tokens, d.McpTokens))
+		mcpReads := r.Group("/", auth.RequireAuthOrMcp(d.Tokens, d.McpTokens, d.BrowserOrigins))
 		{
 			mcpReads.GET("/devices", d.Devices.List)
 			mcpReads.GET("/devices/:id", d.Devices.Get)
 			mcpReads.POST("/webrtc/ice_config", d.Webrtc.IceConfig)
 		}
+		authed.GET("/device-bindings/:requestId", d.Devices.BindingRequest)
 		authed.POST("/devices/:id/bind", d.Devices.Bind)
 		authed.PUT("/devices/:id", d.Devices.Update)
 		authed.DELETE("/cloud/devices/:id", d.Devices.CloudUnbind)
@@ -121,4 +147,18 @@ func NewRouter(d Deps) *gin.Engine {
 	r.GET("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	return r
+}
+
+// Gin's default panic diagnostics can dump Cookie or legacy query credentials.
+// Recover inside this route so the outer recovery cannot emit them.
+func requestRecovery(logger *slog.Logger) gin.HandlerFunc {
+	return gin.RecoveryWithWriter(nil, func(c *gin.Context, value any) {
+		logger.Error("request panic", "method", c.Request.Method,
+			"route", c.FullPath(), "panic_type", fmt.Sprintf("%T", value))
+		if !c.Writer.Written() {
+			c.AbortWithStatus(http.StatusInternalServerError)
+		} else {
+			c.Abort()
+		}
+	})
 }

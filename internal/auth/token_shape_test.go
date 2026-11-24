@@ -13,7 +13,7 @@ import (
 // HS256 signature verifiable with the configured secret (device firmware and
 // web clients parse and possibly verify it).
 func TestSignJWTShape(t *testing.T) {
-	ts := &TokenService{jwtSecret: []byte("arkkvmjwtsecretkey")}
+	ts := &TokenService{jwtSecret: []byte("unit-test-jwt-signing-key")}
 	token := ts.signJWT(6)
 
 	parts := strings.Split(token, ".")

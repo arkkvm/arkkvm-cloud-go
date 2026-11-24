@@ -8,7 +8,7 @@ const (
 )
 
 // ClientRegistry tracks signaling clients for multi-client demux with legacy
-// fallback.
+// fallback. See docs/ws/MULTI_CLIENT_SIGNALING.md.
 type ClientRegistry struct {
 	mu           sync.RWMutex
 	legacy       map[string]*ClientConn            // deviceID → last client (1:1 overwrite)
@@ -22,6 +22,16 @@ func newClientRegistry() *ClientRegistry {
 		byClientID:   map[string]*ClientConn{},
 		byDeviceRole: map[string]map[string]*ClientConn{},
 	}
+}
+
+func (r *ClientRegistry) Snapshot() []*ClientConn {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	clients := make([]*ClientConn, 0, len(r.byClientID))
+	for _, client := range r.byClientID {
+		clients = append(clients, client)
+	}
+	return clients
 }
 
 // NormalizeRole returns user|agent; empty/unknown → user.

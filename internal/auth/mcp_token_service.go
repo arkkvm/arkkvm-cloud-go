@@ -5,9 +5,11 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"strings"
 	"time"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 )
 
 // McpTokenStore is the persistence surface for MCP tokens (implemented by
@@ -20,11 +22,16 @@ type McpTokenStore interface {
 }
 
 // McpTokenService issues and resolves the dedicated arkkvm_mcp credential
-//: long-lived, explicitly revocable, stored as SHA-256 only.
-// Deliberately NOT a Login session — it occupies no single-session slot,
+// (doc 16 §2): long-lived, explicitly revocable, stored as SHA-256 only.
+// Deliberately NOT a Login() session — it occupies no single-session slot,
 // so MCP and browser sessions coexist without evicting each other.
+// MCP credentials expire after inactivity, with an absolute reauthorization cap.
+const McpTokenIdleTTL = 7 * 24 * time.Hour
+const McpTokenMaxTTL = 30 * 24 * time.Hour
+
 type McpTokenService struct {
-	store McpTokenStore
+	store     McpTokenStore
+	OnRevoked func(string)
 }
 
 func NewMcpTokenService(store McpTokenStore) *McpTokenService {
@@ -38,12 +45,13 @@ func (s *McpTokenService) Issue(ctx context.Context, userID int64) (string, erro
 	if _, err := crand.Read(b); err != nil {
 		return "", err
 	}
-	token := hex.EncodeToString(b)
+	token := "mcp2_" + hex.EncodeToString(b)
 	sum := sha256.Sum256([]byte(token))
 	row := &model.McpToken{
 		UserID:    userID,
 		TokenHash: hex.EncodeToString(sum[:]),
 		Name:      "mcp",
+		CreatedAt: time.Now(),
 	}
 	if err := s.store.Create(row); err != nil {
 		return "", err
@@ -54,7 +62,7 @@ func (s *McpTokenService) Issue(ctx context.Context, userID int64) (string, erro
 // Resolve maps a bearer token to its userID, or ErrInvalidToken. Touches
 // last_used_at at most once per minute (a conditional UPDATE, no read-back).
 func (s *McpTokenService) Resolve(ctx context.Context, token string) (int64, error) {
-	if token == "" {
+	if !strings.HasPrefix(token, "mcp2_") || len(token) != 69 {
 		return 0, ErrInvalidToken
 	}
 	sum := sha256.Sum256([]byte(token))
@@ -63,6 +71,13 @@ func (s *McpTokenService) Resolve(ctx context.Context, token string) (int64, err
 		return 0, ErrInvalidToken
 	}
 	now := time.Now()
+	lastUsed := t.CreatedAt
+	if t.LastUsedAt != nil && t.LastUsedAt.After(lastUsed) {
+		lastUsed = *t.LastUsedAt
+	}
+	if t.CreatedAt.IsZero() || !now.Before(t.CreatedAt.Add(McpTokenMaxTTL)) || !now.Before(lastUsed.Add(McpTokenIdleTTL)) {
+		return 0, ErrInvalidToken
+	}
 	if t.LastUsedAt == nil || now.Sub(*t.LastUsedAt) >= time.Minute {
 		_ = s.store.TouchLastUsed(t.ID, now)
 	}
@@ -77,8 +92,17 @@ func (s *McpTokenService) Revoke(ctx context.Context, token string) error {
 	}
 	sum := sha256.Sum256([]byte(token))
 	t, err := s.store.FindActiveByHash(hex.EncodeToString(sum[:]))
-	if err != nil {
+	if errors.Is(err, model.ErrMcpTokenNotFound) || errors.Is(err, ErrInvalidToken) {
 		return nil
 	}
-	return s.store.Revoke(t.ID, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := s.store.Revoke(t.ID, time.Now()); err != nil {
+		return err
+	}
+	if s.OnRevoked != nil {
+		s.OnRevoked(token)
+	}
+	return nil
 }

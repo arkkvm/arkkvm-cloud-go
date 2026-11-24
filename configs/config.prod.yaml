@@ -1,7 +1,10 @@
 # Production environment overrides (ARK_ENV_MODE=prod).
 # All secrets via environment variables; the DB/Redis hosts live in the
-# deployment environment.
+# deployment environment (production instance location: confirm with ops,
+# doc 10 §7).
 oauth2:
+  allowed-return-urls:
+    - "https://app.arkkvm.com/ad-login"
   cookie:
     # Production is served over HTTPS. Apple form_post callbacks require
     # Secure cookies, which enables SameSite=None in CookieManager.

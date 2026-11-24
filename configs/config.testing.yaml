@@ -1,5 +1,7 @@
 # Testing environment overrides (ARK_ENV_MODE=testing).
 oauth2:
+  allowed-return-urls:
+    - "https://app-test.example.com/ad-login"
   cookie:
     # Apple uses a cross-site form_post callback. HTTPS deployments need
     # Secure cookies so CookieManager selects SameSite=None.
@@ -13,7 +15,7 @@ redis:
   db: 11
 
 release:
-  download-cdn: ""   # testing CDN base URL (RELEASE_DOWNLOAD_CDN)
+  download-cdn: "https://minio.jianguodata.com/eblframe-shop/"   # testing uses MinIO (doc 10 §2.3)
 
 log:
   level: debug

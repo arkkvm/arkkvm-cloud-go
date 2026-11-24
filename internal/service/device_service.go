@@ -8,9 +8,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
 )
 
 // DevicePresence abstracts the in-memory WebSocket state so the service layer
@@ -52,7 +52,7 @@ func (s *DeviceService) PrepareDevicePairing(ctx context.Context, deviceID strin
 		hint, _ := s.boundAccountHint(ctx, existing.UserID)
 		return nil, &DeviceBindingConflict{BoundAccount: hint}
 	}
-	return existing.SecretToken, nil
+	return nil, &DeviceBindingConflict{}
 }
 
 func (s *DeviceService) HasDevice(ctx context.Context, deviceID string, userID int64) (bool, error) {
@@ -87,7 +87,11 @@ func (s *DeviceService) UnbindDevice(ctx context.Context, deviceID, secretToken 
 	if err != nil {
 		return err
 	}
-	return s.devices.Delete(dev.ID)
+	if err := s.devices.Delete(dev.ID); err != nil {
+		return err
+	}
+	s.presence.CloseDevice(dev.ID)
+	return nil
 }
 
 // DeleteDevice is the cloud-side unbind: ownership check, delete the row,
@@ -133,14 +137,14 @@ func (s *DeviceService) BelongsToUser(ctx context.Context, deviceID string, user
 // deviceTokenService accepts only explicit confirmation tokens, never an
 // OAuth callback token or a legacy device-shaped login session.
 type deviceTokenService interface {
-	ExchangeConfirmedPairingToken(ctx context.Context, token string) (*auth.DevicePairing, error)
+	ExchangeProtectedPairingToken(ctx context.Context, token, requestID, verifier string) (*auth.DevicePairing, error)
 }
 
 // ExchangeDeviceToken is the cloud step of the existing device /cloud/register
 // flow. Validate the Redis confirmation, then commit ownership and credential
 // together. Retries use the same credential and cannot roll back a later one.
-func (s *DeviceService) ExchangeDeviceToken(ctx context.Context, tokens deviceTokenService, tempToken string) (string, int64, error) {
-	p, err := tokens.ExchangeConfirmedPairingToken(ctx, tempToken)
+func (s *DeviceService) ExchangeDeviceToken(ctx context.Context, tokens deviceTokenService, tempToken, requestID, verifier string) (string, int64, error) {
+	p, err := tokens.ExchangeProtectedPairingToken(ctx, tempToken, requestID, verifier)
 	if err != nil {
 		return "", 0, err
 	}

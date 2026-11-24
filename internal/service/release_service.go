@@ -10,9 +10,9 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/pkg"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/pkg"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
 )
 
 // ReleaseRetrieveVO is the raw (unwrapped) response of GET /releases.
@@ -39,7 +39,7 @@ func NewReleaseService(releases *repository.ReleaseRepo, signer *Signer, downloa
 	return &ReleaseService{releases: releases, signer: signer, downloadCDN: downloadCDN}
 }
 
-// Retrieve implements the deployed-branch semantics:
+// Retrieve implements the deployed-branch semantics (doc 02 §1.4):
 // strict three-segment version compare against the structured
 // major/minor/patch columns, plus distribution gating.
 func (s *ReleaseService) Retrieve(ctx context.Context, appVersion, systemVersion, encryptedDeviceID string) (*ReleaseRetrieveVO, error) {
@@ -125,7 +125,7 @@ func (s *ReleaseService) latestEligible(releaseType string, current pkg.Version,
 // canDistribute applies the distribution rules of the deployed branch:
 //
 //	3 full rollout: always allowed;
-//	1 internal: only for devices listed in device_sns;
+//	1 internal:     only for devices listed in device_sns;
 //	2 gray rollout: stable MD5 bucketing of the device SN against gray%.
 //
 // Rules 1 and 2 require a (decrypted) deviceId; without one nothing but full

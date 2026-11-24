@@ -13,8 +13,7 @@ import (
 
 // microsoftProvider implements the Microsoft Entra ID v2.0 OIDC code flow
 // (tenant configurable, default "common" = consumer + work accounts).
-// Unlike Google this provider REJECTS on any verification failure — no
-// legacy parity to preserve, so the strictest rules apply.
+// Verification failures are fatal, as with the Google provider.
 type microsoftProvider struct {
 	cfg    MicrosoftProviderConfig
 	client *http.Client
@@ -136,7 +135,7 @@ func (p *microsoftProvider) Exchange(ctx context.Context, code, baseURL string) 
 	if claims.Exp > 0 && time.Now().After(time.Unix(claims.Exp+60, 0)) {
 		return nil, errors.New("id_token expired")
 	}
-	// Strict: verification failure is fatal (no Google-style degradation).
+	// Verification failure is fatal.
 	if err := verifyRS256Signature(p.jwks, tokens.IDToken, p.cfg.JWKSURI); err != nil {
 		return nil, fmt.Errorf("id_token signature verification failed: %w", err)
 	}

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -84,7 +84,7 @@ func (r *DeviceRepo) CompleteBinding(ctx context.Context, id string, userID int6
 			ok = true // response-loss retry: keep the exact committed credential
 			return nil
 		}
-		if !sameSecret(current.SecretToken, previousSecret) {
+		if previousSecret == nil || !sameSecret(current.SecretToken, previousSecret) {
 			return nil // a newer pairing has already replaced the snapshot
 		}
 		if err := tx.Model(&model.Device{}).Where("id = ? AND user_id = ?", id, userID).

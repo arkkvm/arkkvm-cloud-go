@@ -3,11 +3,14 @@ package handler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,8 +18,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 )
 
 // memMcpStore is an in-memory auth.McpTokenStore (hash -> row).
@@ -39,7 +42,7 @@ func (s *memMcpStore) Create(t *model.McpToken) error {
 func (s *memMcpStore) FindActiveByHash(hash string) (*model.McpToken, error) {
 	t, ok := s.rows[hash]
 	if !ok || t.RevokedAt != nil {
-		return nil, errors.New("not found")
+		return nil, model.ErrMcpTokenNotFound
 	}
 	return t, nil
 }
@@ -100,7 +103,7 @@ func postJSON(t *testing.T, url, body string) *http.Response {
 // seedGrantCode mints a grant code via the same call the OAuth callback uses.
 func (h *mcpHarness) seedGrantCode(t *testing.T, userID int64, req string) string {
 	t.Helper()
-	code, err := h.tokens.IssueMcpGrantCode(context.Background(), userID, req)
+	code, err := h.tokens.IssueMcpGrantCode(context.Background(), userID, req, testMcpChallenge())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +114,7 @@ func TestMcpTokenExchangeHappyPath(t *testing.T) {
 	h := newMcpHarness(t)
 	code := h.seedGrantCode(t, 42, "req-1")
 
-	resp := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1"}`, code))
+	resp := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, code))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("want 200, got %d", resp.StatusCode)
@@ -156,7 +159,7 @@ func TestMcpTokenExchangeWrongReqBurnsCode(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("wrong req must 401, got %d", resp.StatusCode)
 	}
-	retry := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1"}`, code))
+	retry := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, code))
 	defer retry.Body.Close()
 	if retry.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("code must be burned by the failed attempt, got %d", retry.StatusCode)
@@ -168,7 +171,7 @@ func TestMcpTokenExchangeExpired(t *testing.T) {
 	code := h.seedGrantCode(t, 42, "req-1")
 	h.mr.FastForward(11 * time.Minute)
 
-	resp := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1"}`, code))
+	resp := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, code))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expired code must 401, got %d", resp.StatusCode)
@@ -189,13 +192,15 @@ func TestMcpTokenExchangeMalformed(t *testing.T) {
 func TestMcpRevokeFlow(t *testing.T) {
 	h := newMcpHarness(t)
 	code := h.seedGrantCode(t, 42, "req-1")
-	exchange := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1"}`, code))
+	exchange := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, code))
 	var br BaseResult[struct{ Token string }]
 	if err := json.NewDecoder(exchange.Body).Decode(&br); err != nil {
 		t.Fatal(err)
 	}
 	exchange.Body.Close()
 	token := br.Data.Token
+	notified := make(chan string, 1)
+	h.mcp.OnRevoked = func(value string) { notified <- value }
 
 	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/mcp/revoke", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -207,6 +212,15 @@ func TestMcpRevokeFlow(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("revoke must 200, got %d", resp.StatusCode)
 	}
+	select {
+	case value := <-notified:
+		if value != token {
+			t.Fatal("wrong credential invalidation")
+		}
+	default:
+		t.Fatal("revoke did not notify active sessions")
+	}
+
 	if _, err := h.mcp.Resolve(context.Background(), token); !errors.Is(err, auth.ErrInvalidToken) {
 		t.Fatalf("revoked token must stop resolving, err = %v", err)
 	}
@@ -253,5 +267,96 @@ func TestMcpRevokeRejectsSessionAndAnonymous(t *testing.T) {
 			t.Fatalf("%s must 401 on /mcp/revoke, got %d", name, resp.StatusCode)
 		}
 		resp.Body.Close()
+	}
+}
+
+func testMcpChallenge() string {
+	sum := sha256.Sum256([]byte(strings.Repeat("a", 43)))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func TestMcpExchangeRequiresProof(t *testing.T) {
+	for _, verifier := range []string{"", strings.Repeat("b", 43)} {
+		h := newMcpHarness(t)
+		code := h.seedGrantCode(t, 42, "req-1")
+		response := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":%q}`, code, verifier))
+		response.Body.Close()
+		if response.StatusCode != 401 {
+			t.Fatalf("proof bypass: %d", response.StatusCode)
+		}
+		retry := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":%q}`, code, strings.Repeat("a", 43)))
+		retry.Body.Close()
+		if retry.StatusCode != 401 {
+			t.Fatal("failed proof must burn code")
+		}
+	}
+}
+
+func TestMcpExchangeRejectsOldGrant(t *testing.T) {
+	h := newMcpHarness(t)
+	code := "old-grant"
+	if err := h.mr.Set("ARK:AUTH:MCPCODE:"+code, `{"userId":42,"req":"req-1"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	response := postJSON(t, h.srv.URL+"/mcp/token", fmt.Sprintf(`{"code":%q,"req":"req-1","codeVerifier":%q}`, code, strings.Repeat("a", 43)))
+	defer response.Body.Close()
+	if response.StatusCode != 401 {
+		t.Fatal("old grant accepted")
+	}
+}
+
+func TestMcpTokenAbsoluteExpiry(t *testing.T) {
+	h := newMcpHarness(t)
+	token, err := h.mcp.Issue(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range h.store.rows {
+		row.CreatedAt = time.Now().Add(-auth.McpTokenMaxTTL - time.Second)
+		now := time.Now()
+		row.LastUsedAt = &now
+	}
+	if _, err := h.mcp.Resolve(context.Background(), token); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatal("expired token accepted or renewed by usage")
+	}
+	if _, err := h.mcp.Resolve(context.Background(), strings.Repeat("a", 64)); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatal("old token accepted")
+	}
+}
+
+func TestMcpTokenIdleExpiryAndRenewal(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		age, idle time.Duration
+		valid     bool
+	}{
+		{"idle beyond seven days", 10 * 24 * time.Hour, 8 * 24 * time.Hour, false},
+		{"recent use extends initial seven days", 10 * 24 * time.Hour, 24 * time.Hour, true},
+		{"absolute cap despite recent use", 31 * 24 * time.Hour, time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newMcpHarness(t)
+			token, err := h.mcp.Issue(context.Background(), 42)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, row := range h.store.rows {
+				row.CreatedAt = time.Now().Add(-tc.age)
+				last := time.Now().Add(-tc.idle)
+				row.LastUsedAt = &last
+			}
+			_, err = h.mcp.Resolve(context.Background(), token)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+			if tc.valid {
+				for _, row := range h.store.rows {
+					if time.Since(*row.LastUsedAt) > time.Minute {
+						t.Fatal("successful use not renewed")
+					}
+				}
+			}
+		})
 	}
 }

@@ -10,7 +10,7 @@ func TestDeviceOfferFrameCarriesCredentialedICE(t *testing.T) {
 	frame, err := deviceOfferFrame("cid-1", DeviceOfferData{
 		SD: "v=0",
 		ICECred: []ICEServerCred{{
-			URLs:       []string{"turn:stun.example.com:3478?transport=udp"},
+			URLs:       []string{"turn:stun.arkkvm.cn:3478?transport=udp"},
 			Username:   "1791979895",
 			Credential: "c2VjcmV0",
 		}},

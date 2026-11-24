@@ -3,7 +3,7 @@ package service
 import (
 	"testing"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 )
 
 func intPtr(v int) *int       { return &v }

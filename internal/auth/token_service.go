@@ -1,4 +1,4 @@
-// Package auth replaces Sa-Token: opaque tokens stored in Redis with
+// Package auth replaces Sa-Token (doc 04): opaque tokens stored in Redis with
 // the same semantics as the legacy configuration — 30-day TTL, single session
 // per user (a new login revokes the old token), and an optional per-session
 // "device" attribute used by the device pairing tempToken flow.
@@ -28,8 +28,8 @@ const (
 	pairingKeyPrefix = "ARK:AUTH:PAIR:"    // pairing token -> pairing JSON (non-session)
 	mcpCodeKeyPrefix = "ARK:AUTH:MCPCODE:" // one-time MCP grant code -> grant JSON (non-session)
 
-	defaultSessionTTL = 30 * 24 * time.Hour // sa-token timeout: 2592000s
-	mcpGrantCodeTTL   = 10 * time.Minute
+	SessionTTL      = 30 * 24 * time.Hour // sa-token timeout: 2592000s
+	mcpGrantCodeTTL = 10 * time.Minute
 )
 
 type session struct {
@@ -48,7 +48,7 @@ local old = redis.call('GET', KEYS[1])
 if old then redis.call('DEL', KEYS[2] .. old) end
 redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
 redis.call('SET', KEYS[2] .. ARGV[2], ARGV[1], 'EX', ARGV[3])
-return 1
+return old or ''
 `)
 
 // logoutScript deletes the token key and the user->token index, but only when
@@ -62,6 +62,8 @@ return 1
 `)
 
 type TokenService struct {
+	// OnRevoked is installed at startup. Receives only the displaced/revoked token.
+	OnRevoked func(string)
 	rdb       *redis.Client
 	ttl       time.Duration
 	jwtSecret []byte
@@ -73,7 +75,7 @@ type TokenService struct {
 // treats the token as an opaque string — validity always comes from Redis —
 // but device firmware and web clients parse it, so the shape must not drift.
 func NewTokenService(rdb *redis.Client, jwtSecret string) *TokenService {
-	return &TokenService{rdb: rdb, ttl: defaultSessionTTL, jwtSecret: []byte(jwtSecret)}
+	return &TokenService{rdb: rdb, ttl: SessionTTL, jwtSecret: []byte(jwtSecret)}
 }
 
 func (s *TokenService) signJWT(userID int64) string {
@@ -106,12 +108,15 @@ func (s *TokenService) Login(ctx context.Context, userID int64, device string) (
 	if err != nil {
 		return "", err
 	}
-	err = loginScript.Run(ctx, s.rdb,
+	old, err := loginScript.Run(ctx, s.rdb,
 		[]string{userKey(userID), tokenKeyPrefix},
 		string(body), token, fmt.Sprintf("%d", int(s.ttl.Seconds())),
-	).Err()
+	).Text()
 	if err != nil {
 		return "", err
+	}
+	if old != "" && s.OnRevoked != nil {
+		s.OnRevoked(old)
 	}
 	return token, nil
 }
@@ -205,8 +210,9 @@ func (s *TokenService) RevokePairingToken(ctx context.Context, token string) err
 }
 
 type mcpGrant struct {
-	UserID int64  `json:"userId"`
-	Req    string `json:"req"`
+	UserID    int64  `json:"userId"`
+	Req       string `json:"req"`
+	Challenge string `json:"challenge,omitempty"`
 }
 
 // consumeScript atomically reads and burns a one-time grant code: the code
@@ -218,17 +224,20 @@ if v then redis.call('DEL', KEYS[1]) end
 return v
 `)
 
-// IssueMcpGrantCode mints the one-time MCP grant code: bound to
+// IssueMcpGrantCode mints the one-time MCP grant code (doc 16 §1): bound to
 // the (userID, req) pair — req is the MCP-generated random echoed through
-// the login redirect, so the code can only be exchanged by the local flow
-// that started it. 10-minute TTL, single-use; no session is minted here.
-func (s *TokenService) IssueMcpGrantCode(ctx context.Context, userID int64, req string) (string, error) {
+// the login redirect. Production exchange additionally requires S256 PKCE.
+// 10-minute TTL, single-use; no session is minted here.
+func (s *TokenService) IssueMcpGrantCode(ctx context.Context, userID int64, req, challenge string) (string, error) {
+	if userID <= 0 || req == "" || len(req) > 128 || !ValidMcpChallenge(challenge) {
+		return "", ErrInvalidToken
+	}
 	b := make([]byte, 32)
 	if _, err := crand.Read(b); err != nil {
 		return "", err
 	}
 	code := hex.EncodeToString(b)
-	body, err := json.Marshal(mcpGrant{UserID: userID, Req: req})
+	body, err := json.Marshal(mcpGrant{UserID: userID, Req: req, Challenge: challenge})
 	if err != nil {
 		return "", err
 	}
@@ -236,30 +245,6 @@ func (s *TokenService) IssueMcpGrantCode(ctx context.Context, userID int64, req 
 		return "", err
 	}
 	return code, nil
-}
-
-// ConsumeMcpGrantCode atomically burns the code and returns (userID, req).
-// ErrInvalidToken for unknown/expired codes; the caller compares req.
-func (s *TokenService) ConsumeMcpGrantCode(ctx context.Context, code string) (int64, string, error) {
-	if code == "" {
-		return 0, "", ErrInvalidToken
-	}
-	val, err := consumeScript.Run(ctx, s.rdb, []string{mcpCodeKeyPrefix + code}).Result()
-	if errors.Is(err, redis.Nil) {
-		return 0, "", ErrInvalidToken
-	}
-	if err != nil {
-		return 0, "", err
-	}
-	sval, ok := val.(string)
-	if !ok {
-		return 0, "", ErrInvalidToken
-	}
-	var g mcpGrant
-	if err := json.Unmarshal([]byte(sval), &g); err != nil {
-		return 0, "", ErrInvalidToken
-	}
-	return g.UserID, g.Req, nil
 }
 
 // Logout deletes the session behind a token (idempotent).
@@ -279,10 +264,14 @@ func (s *TokenService) Logout(ctx context.Context, token string) error {
 	if err := json.Unmarshal([]byte(val), &sess); err != nil {
 		return ErrInvalidToken
 	}
-	return logoutScript.Run(ctx, s.rdb,
+	err = logoutScript.Run(ctx, s.rdb,
 		[]string{tokenKeyPrefix + token, userKey(sess.UserID)},
 		token,
 	).Err()
+	if err == nil && s.OnRevoked != nil {
+		s.OnRevoked(token)
+	}
+	return err
 }
 
 func userKey(userID int64) string { return fmt.Sprintf("%s%d", userKeyPrefix, userID) }

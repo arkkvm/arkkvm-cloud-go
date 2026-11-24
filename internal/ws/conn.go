@@ -1,4 +1,4 @@
-// Package ws implements the two WebSocket signaling channels:
+// Package ws implements the two WebSocket signaling channels (doc 05):
 // the device channel at "/" and the client channel at
 // "/webrtc/signaling/client". All connection state lives in the in-process
 // Hub; gorilla/websocket forbids concurrent writers, so every connection owns
@@ -8,6 +8,7 @@ package ws
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -17,12 +18,13 @@ import (
 // push into send from any goroutine; a single writer goroutine is the only
 // code that ever calls WriteMessage.
 type wsConn struct {
-	ws          *websocket.Conn
-	send        chan []byte
-	ctx         context.Context
-	cancel      context.CancelFunc
+	ws           *websocket.Conn
+	send         chan []byte
+	ctx          context.Context
+	cancel       context.CancelFunc
 	writeTimeout time.Duration
-	closeOnce   sync.Once
+	closeOnce    sync.Once
+	closeCode    atomic.Int32
 }
 
 func newWSConn(parent context.Context, ws *websocket.Conn, sendBuffer int, writeTimeout time.Duration) *wsConn {
@@ -43,6 +45,8 @@ func (c *wsConn) start() {
 
 // writer drains the send channel until the connection is cancelled.
 func (c *wsConn) writer() {
+	// Also unblock the reader on write failure, so its session-close cleanup runs.
+	defer c.ws.Close()
 	for {
 		select {
 		case payload := <-c.send:
@@ -52,9 +56,13 @@ func (c *wsConn) writer() {
 				return
 			}
 		case <-c.ctx.Done():
+			code := int(c.closeCode.Load())
+			if code == 0 {
+				code = websocket.CloseGoingAway
+			}
 			_ = c.ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_ = c.ws.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseGoingAway, "server closing"))
+				websocket.FormatCloseMessage(code, "session closed"))
 			_ = c.ws.Close()
 			return
 		}
@@ -81,3 +89,12 @@ func (c *wsConn) Done() <-chan struct{} { return c.ctx.Done() }
 
 // Close cancels the connection exactly once.
 func (c *wsConn) Close() { c.closeOnce.Do(c.cancel) }
+
+func (c *wsConn) closeUnauthorized() {
+	c.closeWithCode(4401)
+}
+
+func (c *wsConn) closeWithCode(code int32) {
+	c.closeCode.Store(code)
+	c.Close()
+}

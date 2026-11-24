@@ -16,7 +16,7 @@ const (
 
 // heartbeatPing is the server->device heartbeat frame sent every 60s. This is
 // the FIXED version of the legacy frame: valid JSON, aligned with the message
-// envelope (migration decision — the legacy `{ type: "ping" }`
+// envelope (migration decision, doc 05 §3.2 — the legacy `{ type: "ping" }`
 // with unquoted keys was a bug, not a protocol).
 var heartbeatPing = []byte(`{"type":"ping"}`)
 
@@ -53,12 +53,13 @@ type ICEServerCred struct {
 // wire (confirmed against the web console bundle), and the device firmware
 // reads the lowercase form.
 type DeviceOfferData struct {
-	SD         string          `json:"sd"`
-	IP         string          `json:"ip"`
-	ICEServers []string        `json:"iceServers"`
-	OidcGoogle string          `json:"oidcGoogle"`
-	ClientType string          `json:"clientType,omitempty"`
-	ICECred    []ICEServerCred `json:"iceServersCred,omitempty"`
+	AuthorizationExpiresAt int64           `json:"authorizationExpiresAt,omitempty"`
+	SD                     string          `json:"sd"`
+	IP                     string          `json:"ip"`
+	ICEServers             []string        `json:"iceServers"`
+	OidcGoogle             string          `json:"oidcGoogle"`
+	ClientType             string          `json:"clientType,omitempty"`
+	ICECred                []ICEServerCred `json:"iceServersCred,omitempty"`
 }
 
 // deviceOfferFrame builds {"type":"offer","client_id":...,"data":{...}}.
@@ -68,13 +69,6 @@ func deviceOfferFrame(clientID string, data DeviceOfferData) ([]byte, error) {
 		ClientID string          `json:"client_id,omitempty"`
 		Data     DeviceOfferData `json:"data"`
 	}{TypeOffer, clientID, data})
-}
-
-// BuildSessionOffer builds the minimal offer frame used by the HTTP session
-// endpoint (POST /webrtc/session, behavior difference D8): only the SDP is
-// known in that path, so ip/iceServers/OidcGoogle stay empty.
-func BuildSessionOffer(sd string) ([]byte, error) {
-	return deviceOfferFrame("", DeviceOfferData{SD: sd})
 }
 
 // messageHeader peeks at type and optional client_id for demux.

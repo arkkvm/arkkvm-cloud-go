@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -12,8 +13,9 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/repository"
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/repository"
+	"arkkvm.com/arkkvm-cloud/internal/service"
 )
 
 func TestMeReturnsIdentityProfileWhenUserFieldsAreMissing(t *testing.T) {
@@ -35,9 +37,16 @@ func TestMeReturnsIdentityProfileWhenUserFieldsAreMissing(t *testing.T) {
 			h := NewUserHandler(service.NewUserService(repository.NewUserRepo(db), repository.NewIdentityRepo(db)), nil)
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
-			c.Request = httptest.NewRequest("GET", "/me", nil)
+			c.Request = httptest.NewRequest("GET", "/me?compatibility=1", nil)
 			c.Set("auth.userID", int64(7))
+			c.Set("auth.sessionToken", "profile-session")
 			h.Me(c)
+			if strings.Contains(w.Body.String(), "compatibilityToken") || strings.Contains(w.Body.String(), "profile-session") {
+				t.Fatal("me exposed a readable session credential")
+			}
+			if w.Header().Get(auth.SessionReferenceHeader) != auth.BrowserSessionReference("profile-session") {
+				t.Fatal("me did not expose the verified session reference")
+			}
 			var body struct {
 				Success bool     `json:"success"`
 				Data    userView `json:"data"`

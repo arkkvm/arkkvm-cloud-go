@@ -1,7 +1,7 @@
 package model
 
 // Release maps to table "releases" (deployed-branch schema, verified on the
-// test environment).
+// test environment, doc 10 §4.1).
 // DeviceSNs is a comma-separated device SN allowlist (used by distribution=1,
 // internal testing), stored as raw TEXT and parsed in the service layer.
 // SortOrder is a legacy column used by the master branch; the deployed branch

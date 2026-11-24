@@ -5,10 +5,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/service"
+	"arkkvm.com/arkkvm-cloud/internal/service"
 )
 
-// ReleaseHandler serves GET /releases (deployed-branch
+// ReleaseHandler serves GET /releases (doc 02 §1.4, deployed-branch
 // semantics). The response is the bare ReleaseRetrieveVO — no BaseResult
 // envelope — with null fields when no update applies.
 type ReleaseHandler struct {
@@ -29,7 +29,7 @@ func (h *ReleaseHandler) Retrieve(c *gin.Context) {
 	if err != nil {
 		// Legacy parity: invalid version input surfaced as the global
 		// exception path (HTTP 200 + code 500 + message).
-		FailCode(c, http.StatusInternalServerError, err.Error())
+		FailCode(c, http.StatusInternalServerError, "Unable to retrieve release information")
 		return
 	}
 	c.JSON(http.StatusOK, vo)

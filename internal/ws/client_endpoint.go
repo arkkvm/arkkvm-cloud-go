@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
 )
 
 // ClientDeviceStore is the device-side validation surface.
@@ -24,9 +25,8 @@ type ClientUserStore interface {
 	OIDCToken(ctx context.Context, userID int64) (string, error)
 }
 
-// McpTokenResolver optionally accepts the dedicated arkkvm_mcp credential on
-// the same signaling path: sessions resolve first with
-// unchanged semantics; only their failure falls back to the MCP token.
+// McpTokenResolver authenticates dedicated MCP Bearer credentials.
+// Browser sessions use a separate Cookie-only path; neither falls back to the other.
 // *auth.McpTokenService satisfies this interface.
 type McpTokenResolver interface {
 	Resolve(ctx context.Context, token string) (int64, error)
@@ -36,52 +36,53 @@ func (e *ClientEndpoint) init() {
 	e.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
-		CheckOrigin:     func(*http.Request) bool { return true },
+		CheckOrigin:     e.allowedOrigin,
 	}
-}
-
-// resolveUserID authenticates the handshake token: web session first
-// (unchanged semantics), MCP credential as the fallback.
-func (e *ClientEndpoint) resolveUserID(ctx context.Context, token string) (int64, error) {
-	userID, _, err := e.Tokens.Resolve(ctx, token)
-	if err == nil {
-		return userID, nil
-	}
-	if e.McpTokens != nil {
-		if mcpID, merr := e.McpTokens.Resolve(ctx, token); merr == nil {
-			return mcpID, nil
-		}
-	}
-	return 0, auth.ErrInvalidToken
 }
 
 // ClientEndpoint serves the browser signaling channel mounted at
-// "/webrtc/signaling/client?id=<deviceId>&token=<webToken>". Handshake order
-// mirrors the legacy ClientSocketHandlerInterceptor: device
+// "/webrtc/signaling/client?id=<deviceId>". Credentials arrive via a protected
+// browser cookie, an MCP Authorization header, never a URL credential.
+// Handshake order
+// mirrors the legacy ClientSocketHandlerInterceptor (doc 02 §2.2): device
 // online -> session token valid -> device belongs to user -> user exists.
 type ClientEndpoint struct {
-	Hub        *Hub
-	Tokens     *auth.TokenService
-	McpTokens  McpTokenResolver // optional: enables the MCP credential
-	Devices    ClientDeviceStore
-	Users      ClientUserStore
-	ICEServers []string
+	OnConnected func(userID int64, request *http.Request, lifetime context.Context)
+	Hub         *Hub
+	Tokens      *auth.TokenService
+	McpTokens   McpTokenResolver // optional: enables the MCP credential
+	Devices     ClientDeviceStore
+	Users       ClientUserStore
+	ICEServers  []string
 	// ICECredIssuer optionally supplies credential-bearing ICE entries
 	// (self-hosted/Cloudflare TURN) stamped into each offer frame's additive
 	// iceServersCred field; legacy firmware ignores the field.
-	ICECredIssuer func() []ICEServerCred
-	Options       Options
-	Log           *slog.Logger
-	Lifetime      context.Context
+	ICECredIssuer     func() []ICEServerCred
+	Options           Options
+	Log               *slog.Logger
+	Lifetime          context.Context
+	AllowedReturnURLs []string
 
 	upgrader websocket.Upgrader
+	initOnce sync.Once
 }
 
 func (e *ClientEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if e.upgrader.CheckOrigin == nil {
-		e.init()
+	e.initOnce.Do(e.init)
+	token, credentialKind, err := e.signalingHandshakeCredential(r)
+	if err != nil {
+		http.Error(w, "invalid signaling credentials", http.StatusUnauthorized)
+		return
 	}
 	q := r.URL.Query()
+	if credentialKind == signalingMcpCredential && q.Get("clientType") != RoleAgent {
+		http.Error(w, "MCP requires agent role", http.StatusForbidden)
+		return
+	}
+	if credentialKind == signalingSessionCredential && q.Get("clientType") != "" && q.Get("clientType") != RoleUser {
+		http.Error(w, "browser requires user role", http.StatusForbidden)
+		return
+	}
 	deviceID := q.Get("id")
 	if deviceID == "" {
 		http.Error(w, "missing device id", http.StatusBadRequest)
@@ -94,7 +95,19 @@ func (e *ClientEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, err := e.resolveUserID(r.Context(), q.Get("token"))
+	var userID int64
+	authSource := "cookie"
+	switch credentialKind {
+	case signalingSessionCredential:
+		userID, _, err = e.Tokens.Resolve(r.Context(), token)
+	case signalingMcpCredential:
+		authSource = "mcp_bearer"
+		err = auth.ErrInvalidToken
+		if e.McpTokens != nil {
+			userID, err = e.McpTokens.Resolve(r.Context(), token)
+		}
+
+	}
 	if err != nil {
 		e.Log.Warn("client wshandler: token invalid", "device_id", deviceID)
 		http.Error(w, "invalid token", http.StatusUnauthorized)
@@ -124,34 +137,49 @@ func (e *ClientEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	base.start() // launch the writer goroutine — without it no frame ever leaves this connection
 
 	clientID := uuid.NewString()
-	roleQuery := q.Get("clientType")
-	multiplex := roleQuery == RoleUser || roleQuery == RoleAgent
-	role := ""
-	if multiplex {
-		role = NormalizeRole(roleQuery)
+	role := RoleUser
+	if credentialKind == signalingMcpCredential {
+		role = RoleAgent
 	}
+	multiplex := true
 
 	client := &ClientConn{
-		wsConn:    base,
-		DeviceID:  deviceID,
-		UserID:    userID,
-		OIDCToken: oidcToken,
-		ClientID:  clientID,
-		Role:      role,
-		Multiplex: multiplex,
+		CredentialHash: credentialHash(token),
+		deviceConn:     device,
+		wsConn:         base,
+		DeviceID:       deviceID,
+		UserID:         userID,
+		OIDCToken:      oidcToken,
+		ClientID:       clientID,
+		Role:           role,
+		AuthMCP:        credentialKind == signalingMcpCredential,
+		Multiplex:      multiplex,
 	}
 	if replaced := e.Hub.AddClient(client); replaced != nil {
 		e.Log.Info("client wshandler: replacing same-role connection",
 			"device_id", deviceID, "role", role, "old_client_id", replaced.ClientID)
-		replaced.Close()
+		replaced.closeWithCode(4409)
+	}
+	if e.OnConnected != nil {
+		e.OnConnected(userID, r, client.ctx)
 	}
 	e.Log.Info("client wshandler: user connected to device",
-		"device_id", deviceID, "user_id", userID, "client_id", clientID, "multiplex", multiplex)
+		"device_id", deviceID, "user_id", userID, "client_id", clientID, "multiplex", multiplex, "auth_source", authSource)
 
 	defer func() {
+		client.Close()
+		// Target the original device connection, never a replacement generation.
+		if device.SessionAuthLease && device.wsConn != nil {
+			_ = device.SendTo(authorizationFrame("session_close", client.ClientID, 0))
+		}
 		e.Hub.RemoveClient(client)
 		e.Log.Info("client wshandler: connection closed", "device_id", deviceID, "client_id", clientID)
 	}()
+	if !e.authorized(r.Context(), client, device, token) {
+		client.wsConn.closeUnauthorized()
+		return
+	}
+	go e.watchAuthorization(client, device, token)
 
 	// First frame: device metadata + minted client_id.
 	if frame, err := deviceMetadataFrame(clientID, device.DeviceVersion); err == nil {
@@ -160,12 +188,12 @@ func (e *ClientEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		e.Log.Error("client wshandler: marshal metadata failed", "error", err)
 	}
 
-	e.readPump(client, device)
+	e.readPump(client, device, token)
 }
 
 // readPump consumes client frames: plain "ping", offer (enriched and
 // forwarded to the device), and new-ice-candidate (forwarded with client_id).
-func (e *ClientEndpoint) readPump(client *ClientConn, device *DeviceConn) {
+func (e *ClientEndpoint) readPump(client *ClientConn, device *DeviceConn, token string) {
 	client.ws.SetReadLimit(e.Options.MaxMessageSize)
 	for {
 		_ = client.ws.SetReadDeadline(time.Now().Add(e.Options.ReadDeadline))
@@ -187,14 +215,32 @@ func (e *ClientEndpoint) readPump(client *ClientConn, device *DeviceConn) {
 		}
 		switch req.Type {
 		case TypeOffer:
-			e.Log.Debug("client wshandler: received offer", "device_id", client.DeviceID, "sd_len", len(req.Data.SD))
+			var expires int64
+			if device.SessionAuthLease {
+				expires = time.Now().Add(authorizationLeaseTTL).UnixMilli()
+			}
+			if !e.authorized(client.ctx, client, device, token) || client.ctx.Err() != nil {
+				client.wsConn.closeUnauthorized()
+				return
+			}
 			clientType := req.Data.ClientType
+			if !client.AuthMCP && clientType != "" && clientType != RoleUser {
+				client.closeWithCode(4403)
+				return
+			}
+			if client.AuthMCP && clientType != "" && clientType != RoleAgent {
+				client.Close()
+				return
+			}
+			if client.AuthMCP {
+				clientType = RoleAgent
+			}
 			if clientType == RoleUser || clientType == RoleAgent {
 				if !client.Multiplex || client.Role != NormalizeRole(clientType) {
 					if replaced := e.Hub.PromoteClientRole(client, clientType); replaced != nil && replaced != client {
 						e.Log.Info("client wshandler: role promote replaced peer",
 							"device_id", client.DeviceID, "role", clientType, "old_client_id", replaced.ClientID)
-						replaced.Close()
+						replaced.closeWithCode(4409)
 					}
 				}
 			} else if clientType == "" {
@@ -205,12 +251,13 @@ func (e *ClientEndpoint) readPump(client *ClientConn, device *DeviceConn) {
 				iceCred = e.ICECredIssuer()
 			}
 			frame, err := deviceOfferFrame(client.ClientID, DeviceOfferData{
-				SD:         req.Data.SD,
-				IP:         device.IP,
-				ICEServers: e.ICEServers,
-				OidcGoogle: client.OIDCToken,
-				ClientType: clientType,
-				ICECred:    iceCred,
+				AuthorizationExpiresAt: expires,
+				SD:                     req.Data.SD,
+				IP:                     device.IP,
+				ICEServers:             e.ICEServers,
+				OidcGoogle:             client.OIDCToken,
+				ClientType:             clientType,
+				ICECred:                iceCred,
 			})
 			if err != nil {
 				e.Log.Error("client wshandler: marshal offer failed", "error", err)

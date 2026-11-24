@@ -1,6 +1,6 @@
 # Base configuration — environment profiles (config.testing.yaml /
-# config.prod.yaml / config.cn.yaml) merge on top; secrets arrive via
-# environment variables only.
+# config.prod.yaml) merge on top; secrets arrive via environment variables
+# only (doc 08 §2.3).
 server:
   port: 6612
 
@@ -9,10 +9,10 @@ server:
 ip:
   v4-db-path: ""        # ARK_IP_V4_DB_PATH
   v6-db-path: ""        # ARK_IP_V6_DB_PATH
-  trusted-proxies: []    # ARK_IP_TRUSTED_PROXIES, comma-separated IPs/CIDRs
+  trusted-proxies: []    # ARK_IP_TRUSTED_PROXIES; shared by /ip, OAuth and device WS; IPs/CIDRs
 
 db:
-  driver: mysql   # mysql | postgres
+  driver: mysql   # mysql | postgres (doc 09 phase 2)
   dsn: ""         # ARK_DB_DSN, e.g. user:pass@tcp(mysql:3306)/ark-kvm?charset=utf8mb4&parseTime=True&loc=UTC
 
 redis:
@@ -21,6 +21,10 @@ redis:
   db: 11
 
 oauth2:
+  # OAuth returns to the cloud UI, never directly to an arbitrary device.
+  # Device addresses are preserved by the cloud confirmation flow separately.
+  allowed-return-urls:
+    - "http://localhost/ad-login"
   google:
     client-id: ""            # OAUTH_GOOGLE_CLIENT_ID
     client-secret: ""        # OAUTH_GOOGLE_CLIENT_SECRET
@@ -29,8 +33,8 @@ oauth2:
     auth-uri: "https://accounts.google.com/o/oauth2/v2/auth"
     token-uri: "https://oauth2.googleapis.com/token"
     jwks-uri: "https://www.googleapis.com/oauth2/v3/certs"
-    verify-id-token: true
-  # New providers: registered only when BOTH id and secret are set
+    verify-id-token: true   # legacy key; Google verification can no longer be disabled
+  # New providers (doc 14): registered only when BOTH id and secret are set
   # (a half-configured provider would register a login that always fails).
   # Endpoints below default automatically; only secrets need env wiring.
   microsoft:                 # OAUTH_MICROSOFT_CLIENT_ID / OAUTH_MICROSOFT_CLIENT_SECRET
@@ -55,18 +59,18 @@ oauth2:
     key-id: ""
     private-key: ""          # p8 PEM raw, \n-escaped, or a file path
     redirect-uri: "{baseUrl}/oauth2/code/apple"
-  # Phase-C gate: stop the legacy clientId/oidcGoogle
+  # Phase-C gate skeleton (doc 14 §7C): stop the legacy clientId/oidcGoogle
   # params on google PAIRING redirects for devices with cloud_version >= this
   # threshold. Empty = never stop (current behavior). Arm it only after the
   # de-providerized firmware version is final and OTA telemetry confirms.
   pairing:
     stop-legacy-params-version: ""   # OAUTH_PAIRING_STOP_LEGACY_PARAMS_VERSION, e.g. "0.4.26091001"
   cookie:
-    signing-key: ""   # COOKIE_SIGNING_KEY
+    signing-key: ""   # COOKIE_SIGNING_KEY (rotate at cutover, doc 06)
     max-age: 86400
-    secure: false
+    secure: true
   trust-proxy-headers: true
-  quick-login-require-secret: true   # /oidc/quick must present the device secretToken
+  quick-login-require-secret: true   # legacy key; header authentication can no longer be disabled
 
 webrtc:
   cloudflare:
@@ -89,7 +93,7 @@ auth:
   jwt-secret-key: ""   # ARK_JWT_SECRET — must equal the legacy sa-token jwt-secret-key (device firmware validates the token shape)
 
 security:
-  expose-sensitive-fields: false   # strips oidcToken/secretToken from API responses
+  expose-sensitive-fields: false   # strips oidcToken/secretToken from API responses (doc 06 §5)
 
 cors:
   allow-origins:
@@ -103,4 +107,4 @@ ws:
   read-deadline: 180s
   write-timeout: 30s
   send-buffer-size: 256
-  max-message-size: 524288   # 512KB, aligned with the legacy firmware
+  max-message-size: 524288   # 512KB, aligned with the legacy container

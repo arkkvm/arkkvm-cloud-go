@@ -1,14 +1,15 @@
 package repository
 
 import (
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 )
 
-// McpTokenRepo persists mcp_tokens rows: lookup is always by
+// McpTokenRepo persists mcp_tokens rows (doc 16 §2): lookup is always by
 // token hash, never by user-facing fields.
 type McpTokenRepo struct{ DB *gorm.DB }
 
@@ -20,6 +21,9 @@ func (r *McpTokenRepo) Create(t *model.McpToken) error { return r.DB.Create(t).E
 func (r *McpTokenRepo) FindActiveByHash(hash string) (*model.McpToken, error) {
 	var t model.McpToken
 	err := r.DB.Where("token_hash = ? AND revoked_at IS NULL", hash).First(&t).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, model.ErrMcpTokenNotFound
+	}
 	if err != nil {
 		return nil, err
 	}

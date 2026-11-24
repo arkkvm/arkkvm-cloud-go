@@ -5,10 +5,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/auth"
+	"arkkvm.com/arkkvm-cloud/internal/auth"
 )
 
-// McpHandler serves the arkkvm_mcp credential endpoints:
+// McpHandler serves the arkkvm_mcp credential endpoints (doc 16 §3.4):
 // POST /mcp/token exchanges a one-time grant code for the long-lived MCP
 // token; POST /mcp/revoke self-revokes the presented token.
 type McpHandler struct {
@@ -21,8 +21,9 @@ func NewMcpHandler(codes *auth.TokenService, tokens *auth.McpTokenService) *McpH
 }
 
 type mcpTokenRequest struct {
-	Code string `json:"code"`
-	Req  string `json:"req"`
+	Code         string `json:"code"`
+	Req          string `json:"req"`
+	CodeVerifier string `json:"codeVerifier"`
 }
 
 // ExchangeToken (POST /mcp/token) burns the grant code, verifies the req
@@ -30,6 +31,8 @@ type mcpTokenRequest struct {
 // shape: the code is single-use and burned on each attempt, so a req guess
 // gets exactly one shot per code.
 func (h *McpHandler) ExchangeToken(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)
 	var body mcpTokenRequest
 	if err := c.ShouldBindJSON(&body); err != nil || body.Code == "" || body.Req == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{
@@ -40,7 +43,7 @@ func (h *McpHandler) ExchangeToken(c *gin.Context) {
 		})
 		return
 	}
-	userID, boundReq, err := h.codes.ConsumeMcpGrantCode(c.Request.Context(), body.Code)
+	userID, err := h.codes.ExchangeMcpGrant(c.Request.Context(), body.Code, body.Req, body.CodeVerifier)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"success": false,
@@ -50,15 +53,7 @@ func (h *McpHandler) ExchangeToken(c *gin.Context) {
 		})
 		return
 	}
-	if body.Req != boundReq {
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"success": false,
-			"message": "grant code binding mismatch",
-			"code":    0,
-			"data":    nil,
-		})
-		return
-	}
+
 	token, err := h.tokens.Issue(c.Request.Context(), userID)
 	if err != nil {
 		FailCode(c, 500, "token mint failed")

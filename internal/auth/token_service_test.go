@@ -53,7 +53,7 @@ func TestResolveDeviceRejectsWebSession(t *testing.T) {
 	}
 }
 
-// The pairing token is a non-session credential: it coexists with
+// The pairing token is a non-session credential (doc 14 §4): it coexists with
 // the user's web session instead of kicking it, never resolves as a session,
 // and only dies on an explicit revoke (resolve is read-only so a firmware
 // retry after a network failure still finds it).

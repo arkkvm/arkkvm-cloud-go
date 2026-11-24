@@ -11,7 +11,7 @@ import (
 // BaseResult is the response envelope of every JSON endpoint. Field names and
 // the unusual code semantics (1 = success, 0 = business failure, 500 =
 // unhandled error; business failures ride on HTTP 200) replicate the legacy
-// vo.BaseResult exactly.
+// vo.BaseResult exactly (doc 02 §0.1).
 type BaseResult[T any] struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
@@ -33,7 +33,7 @@ func Fail(c *gin.Context, message string) {
 
 // FailCode is the global-exception-handler equivalent: HTTP 200 with a
 // non-zero error code (500 for unhandled errors, matching the legacy advice
-// handler that mapped Exception -> BaseResult.fail(500, ex.getMessage)).
+// handler that mapped Exception -> BaseResult.fail(500, ex.getMessage())).
 func FailCode(c *gin.Context, code int, message string) {
 	c.JSON(http.StatusOK, BaseResult[any]{Success: false, Message: message, Code: code})
 }

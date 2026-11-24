@@ -1,9 +1,11 @@
 # CN (mainland China) deployment overlay — selected by ARK_ENV_MODE=cn.
 # Only region-specific overrides live here; everything else inherits the
 # base config.yaml. Secrets are provided exclusively via environment
-# variables and never in this file.
+# variables (doc 08 §2.3) and never in this file.
 
 oauth2:
+  allowed-return-urls:
+    - "https://app.arkkvm.cn/ad-login"
   # Google sign-in is withdrawn: its OAuth endpoints are unreachable from
   # mainland China, so the button only carried users into an authorize
   # round-trip that could never complete. Credentials stay in .env; removing
@@ -17,16 +19,16 @@ oauth2:
 
 webrtc:
   # Domestic STUN only: Google/Cloudflare STUN are unreliable from CN.
-  # TURN relay goes through a self-hosted coturn: webrtc.selfhosted.secret
-  # (env TURN_STATIC_AUTH_SECRET, same value as coturn's static-auth-secret)
-  # mints short-lived credentials for these URLs. Point these at your own
-  # deployment.
+  # TURN relay goes through the self-hosted coturn (stun.arkkvm.cn):
+  # webrtc.selfhosted.secret (env
+  # TURN_STATIC_AUTH_SECRET, same value as coturn's static-auth-secret)
+  # mints short-lived credentials for these URLs.
   ice-servers:
-    - "stun:stun.example.com:3478"
+    - "stun:stun.arkkvm.cn:3478"
   selfhosted:
     turn-urls:
-      - "turn:turn.example.com:3478?transport=udp"
-      - "turn:turn.example.com:3478?transport=tcp"
+      - "turn:stun.arkkvm.cn:3478?transport=udp"
+      - "turn:stun.arkkvm.cn:3478?transport=tcp"
 
 release:
   download-cdn: "https://app.arkkvm.cn/dl-img/arkkvm/"

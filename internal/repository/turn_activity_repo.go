@@ -1,7 +1,7 @@
 package repository
 
 import (
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 	"gorm.io/gorm"
 )
 

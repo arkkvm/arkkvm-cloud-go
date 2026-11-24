@@ -1,4 +1,4 @@
-module github.com/arkkvm/arkkvm-cloud-go
+module arkkvm.com/arkkvm-cloud
 
 go 1.26.5
 

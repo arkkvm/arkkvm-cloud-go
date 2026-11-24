@@ -4,7 +4,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/api/handler"
+	"arkkvm.com/arkkvm-cloud/internal/api/handler"
 )
 
 func TestIPRouteIsPublic(t *testing.T) {

@@ -4,6 +4,7 @@
 package config
 
 import (
+	"arkkvm.com/arkkvm-cloud/internal/pkg"
 	"fmt"
 	"os"
 	"strings"
@@ -24,7 +25,7 @@ type Config struct {
 	} `mapstructure:"server"`
 
 	DB struct {
-		Driver string `mapstructure:"driver"` // mysql | postgres
+		Driver string `mapstructure:"driver"` // mysql | postgres (reserved for phase 2, doc 09)
 		DSN    string `mapstructure:"dsn"`
 	} `mapstructure:"db"`
 
@@ -43,10 +44,10 @@ type Config struct {
 			AuthURI       string `mapstructure:"auth-uri"`
 			TokenURI      string `mapstructure:"token-uri"`
 			JWKSURI       string `mapstructure:"jwks-uri"`
-			VerifyIDToken bool   `mapstructure:"verify-id-token"` // degrade to parse-only with WARN when JWKS unreachable
+			VerifyIDToken bool   `mapstructure:"verify-id-token"` // legacy config retained; Google signature verification is always enforced
 		} `mapstructure:"google"`
 		// New providers: registered only when client-id/app-id is non-empty
-		//. Google keeps its legacy block and is always served —
+		// (doc 14 §6). Google keeps its legacy block and is always served —
 		// unless DisabledProviders withdraws it for this deployment.
 		Microsoft struct {
 			ClientID     string `mapstructure:"client-id"` // env OAUTH_MICROSOFT_CLIENT_ID
@@ -95,7 +96,8 @@ type Config struct {
 		// /oidc/providers; stored identities are untouched, so re-enabling
 		// is a config-only change.
 		DisabledProviders []string `mapstructure:"disabled-providers"`
-		// Phase-C gate skeleton: when set, google
+		AllowedReturnURLs []string `mapstructure:"allowed-return-urls"`
+		// Phase-C gate skeleton (doc 14 §7C, 05 §3.1): when set, google
 		// PAIRING redirects stop carrying the legacy clientId/oidcGoogle
 		// params for devices whose cloud_version >= this threshold.
 		// Empty = never stop (today's behavior). Devices with unknown or
@@ -112,7 +114,7 @@ type Config struct {
 		} `mapstructure:"cookie"`
 		// Whether to trust X-Forwarded-* headers when deriving the OAuth base URL.
 		TrustProxyHeaders bool `mapstructure:"trust-proxy-headers"`
-		// /oidc/quick must present the device secretToken (P0 fix). Default true.
+		// Legacy setting retained for config compatibility; /oidc/quick is retired.
 		QuickLoginRequireSecret bool `mapstructure:"quick-login-require-secret"`
 	} `mapstructure:"oauth2"`
 
@@ -123,7 +125,7 @@ type Config struct {
 		} `mapstructure:"cloudflare"`
 		SelfHosted struct {
 			Secret   string   `mapstructure:"secret"`    // coturn static-auth-secret, env TURN_STATIC_AUTH_SECRET
-			TurnURLs []string `mapstructure:"turn-urls"` // e.g. turn:stun.example.com:3478?transport=udp
+			TurnURLs []string `mapstructure:"turn-urls"` // e.g. turn:stun.arkkvm.cn:3478?transport=udp
 		} `mapstructure:"selfhosted"`
 		ICEServers []string `mapstructure:"ice-servers"`
 	} `mapstructure:"webrtc"`
@@ -140,7 +142,7 @@ type Config struct {
 	} `mapstructure:"sign"`
 
 	Security struct {
-		// Strip oidcToken from /me and secretToken from /devices/{id} by default.
+		// Strip oidcToken from /me and secretToken from /devices/{id} by default (doc 06 §5).
 		// Enable temporarily only if the frontend is confirmed to consume those fields.
 		ExposeSensitiveFields bool `mapstructure:"expose-sensitive-fields"`
 	} `mapstructure:"security"`
@@ -171,6 +173,11 @@ type Config struct {
 }
 
 func (c *Config) Validate() error {
+	for _, raw := range c.OAuth2.AllowedReturnURLs {
+		if _, err := pkg.ParseOAuthReturnURL(raw); err != nil {
+			return fmt.Errorf("oauth2.allowed-return-urls contains an invalid callback")
+		}
+	}
 	if c.DB.DSN == "" {
 		return fmt.Errorf("db.dsn is not configured (ARK_DB_DSN)")
 	}
@@ -202,6 +209,7 @@ func Load(configDir string) (*Config, error) {
 	// Bool defaults must go through SetDefault: Unmarshal cannot distinguish
 	// "not set" from a false zero value.
 	v.SetDefault("oauth2.google.verify-id-token", true)
+	v.SetDefault("oauth2.cookie.secure", true)
 	v.SetDefault("oauth2.quick-login-require-secret", true)
 
 	if err := v.ReadInConfig(); err != nil {
@@ -214,7 +222,7 @@ func Load(configDir string) (*Config, error) {
 		}
 	}
 
-	// Secrets are provided exclusively via environment variables.
+	// Secrets are provided exclusively via environment variables (doc 08 §2.3).
 	bindEnv(v, map[string]string{
 		"ip.v4-db-path":                             "ARK_IP_V4_DB_PATH",
 		"ip.v6-db-path":                             "ARK_IP_V6_DB_PATH",
@@ -225,6 +233,7 @@ func Load(configDir string) (*Config, error) {
 		"redis.addr":                                "ARK_REDIS_ADDR",
 		"redis.password":                            "ARK_REDIS_PASSWORD",
 		"redis.db":                                  "ARK_REDIS_DB",
+		"oauth2.allowed-return-urls":                "OAUTH_ALLOWED_RETURN_URLS",
 		"oauth2.google.client-id":                   "OAUTH_GOOGLE_CLIENT_ID",
 		"oauth2.google.client-secret":               "OAUTH_GOOGLE_CLIENT_SECRET",
 		"oauth2.microsoft.client-id":                "OAUTH_MICROSOFT_CLIENT_ID",

@@ -14,7 +14,7 @@ import (
 // githubProvider implements the GitHub OAuth2 flow (OAuth2 + REST, no
 // id_token): the code swaps for an access_token, then /user and /user/emails
 // supply the identity. An email counts as verified only when GitHub marks it
-// primary && verified.
+// primary && verified (doc 14 §3).
 type githubProvider struct {
 	cfg    GitHubProviderConfig
 	client *http.Client

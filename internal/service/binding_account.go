@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/model"
+	"arkkvm.com/arkkvm-cloud/internal/model"
 )
 
 // BoundAccountHint is for recognizing an existing owner, never authenticating

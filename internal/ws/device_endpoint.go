@@ -4,24 +4,27 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gorilla/websocket"
 
-	"github.com/arkkvm/arkkvm-cloud-go/internal/pkg"
+	"arkkvm.com/arkkvm-cloud/internal/pkg"
 )
 
 // DeviceEndpoint serves the device WebSocket channel mounted at "/".
-// Handshake order mirrors the legacy DeviceSocketHandleInterceptor:
+// Handshake order mirrors the legacy DeviceSocketHandleInterceptor (doc 02 §2.1):
 // Bearer secretToken lookup -> X-Device-Id match -> version headers -> real IP
 // -> cloud_version sync -> upgrade. Handshake failures answer with a proper
 // HTTP status (the legacy Spring 200-empty is not a protocol requirement).
 type DeviceEndpoint struct {
-	Hub        *Hub
-	RealDevice DeviceStore
-	Options    Options
-	Log        *slog.Logger
-	Lifetime   context.Context // cancelled on server shutdown
+	OnConnected    func(deviceID, ip string, lifetime context.Context)
+	TrustedProxies *pkg.TrustedProxies
+	Hub            *Hub
+	RealDevice     DeviceStore
+	Options        Options
+	Log            *slog.Logger
+	Lifetime       context.Context // cancelled on server shutdown
 
 	upgrader websocket.Upgrader
 }
@@ -34,7 +37,7 @@ type DeviceStore interface {
 	UpdateCloudVersion(ctx context.Context, deviceID, cloudVersion string) error
 }
 
-// Options carries the tuned WebSocket parameters.
+// Options carries the tuned WebSocket parameters (doc 03 §6).
 type Options struct {
 	SendBuffer        int
 	WriteTimeout      time.Duration
@@ -47,11 +50,17 @@ func (e *DeviceEndpoint) init() {
 	e.upgrader = websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
-		CheckOrigin:     func(*http.Request) bool { return true }, // parity with setAllowedOrigins("*")
+		CheckOrigin:     nativeWebSocketRequest,
 	}
 }
 
 func (e *DeviceEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is firmware-only: reject browser handshakes before any
+	// credential lookup or device-version mutation.
+	if !nativeWebSocketRequest(r) {
+		http.Error(w, "browser origin not allowed", http.StatusForbidden)
+		return
+	}
 	if e.upgrader.CheckOrigin == nil {
 		e.init()
 	}
@@ -84,7 +93,7 @@ func (e *DeviceEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cloudVersion = r.Header.Get("X-Web-Version")
 	}
 	ignorePing := r.Header.Get("X-Ignore-Ping") == "true"
-	realIP := pkg.RealIP(r)
+	realIP := pkg.RealIP(r, e.TrustedProxies)
 
 	if cloudVersion != "" && (cloudVersionDB == nil || *cloudVersionDB != cloudVersion) {
 		if err := e.RealDevice.UpdateCloudVersion(r.Context(), deviceID, cloudVersion); err != nil {
@@ -92,7 +101,9 @@ func (e *DeviceEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	conn, err := e.upgrader.Upgrade(w, r, nil)
+	headers := http.Header{}
+	headers.Set("X-Cloud-Time-Ms", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	conn, err := e.upgrader.Upgrade(w, r, headers)
 	if err != nil {
 		e.Log.Warn("device wshandler: upgrade failed", "device_id", deviceID, "error", err)
 		return
@@ -101,20 +112,22 @@ func (e *DeviceEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	base := newWSConn(e.Lifetime, conn, e.Options.SendBuffer, e.Options.WriteTimeout)
 	base.start() // launch the writer goroutine — without it no frame ever leaves this connection
 	device := &DeviceConn{
-		wsConn:        base,
-		DeviceID:      deviceID,
-		DeviceVersion: deviceVersion,
-		CloudVersion:  cloudVersion,
-		IP:            realIP,
+		wsConn:           base,
+		DeviceID:         deviceID,
+		DeviceVersion:    deviceVersion,
+		SessionAuthLease: r.Header.Get("X-Cloud-Session-Auth") == "lease-v1",
+		CloudVersion:     cloudVersion,
+		IP:               realIP,
 	}
 	e.Hub.RegisterDevice(device)
+	if e.OnConnected != nil {
+		e.OnConnected(deviceID, realIP, device.ctx)
+	}
 	e.Log.Info("device wshandler: device connected",
 		"device_id", deviceID, "version", deviceVersion, "cloud_version", cloudVersion, "ip", realIP)
 
 	if !ignorePing {
 		go e.heartbeat(device)
-	} else {
-		e.Log.Debug("device wshandler: ignore server ping", "device_id", deviceID)
 	}
 
 	defer func() {
@@ -138,7 +151,6 @@ func (e *DeviceEndpoint) heartbeat(device *DeviceConn) {
 				device.Close()
 				return
 			}
-			e.Log.Debug("device heartbeat: sent ping", "device_id", device.DeviceID)
 		case <-device.Done():
 			return
 		}
@@ -165,7 +177,6 @@ func (e *DeviceEndpoint) readPump(device *DeviceConn) {
 			_ = device.SendTo(pongFrame)
 			continue
 		}
-		e.Log.Debug("device wshandler: received message", "device_id", device.DeviceID, "payload_len", len(payload))
 		e.Hub.DispatchDeviceMessage(device.DeviceID, payload)
 	}
 }

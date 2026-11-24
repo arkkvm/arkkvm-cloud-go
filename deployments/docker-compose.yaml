@@ -1,6 +1,7 @@
-# Testing-environment compose. Port 6614 lets the service run in parallel
-# with another instance on 6612; adjust as needed. Secrets come from the
-# .env file or the shell — never commit them.
+# Testing-environment compose (doc 10 §6.2). Port 6614 lets the Go service
+# run in parallel with the legacy Java container on 6612 during verification;
+# swap to 6612 at cutover. Secrets come from the .env file or the shell —
+# never commit them.
 services:
   arkkvm-cloud-testing:
     container_name: arkkvm-cloud-testing
@@ -22,7 +23,7 @@ services:
       ARK_REDIS_DB: "11"
       OAUTH_GOOGLE_CLIENT_ID: ${OAUTH_GOOGLE_CLIENT_ID}
       OAUTH_GOOGLE_CLIENT_SECRET: ${OAUTH_GOOGLE_CLIENT_SECRET}
-      # Multi-provider OAuth — unset vars mean "not configured",
+      # Multi-provider OAuth (doc 14 §6) — unset vars mean "not configured",
       # the provider is simply not registered.
       OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
       OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
